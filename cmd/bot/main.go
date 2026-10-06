@@ -38,18 +38,29 @@ func run(syncOnce bool) (err error) {
 		fmt.Fprintf(os.Stderr, "config error:\n%v\n", err)
 		return err
 	}
-	log, closer, err := logging.New(logging.Options{
+	logOpts := logging.Options{
 		Level:       cfg.LogLevel,
 		File:        cfg.LogFile,
 		MaxSizeMB:   cfg.LogMaxSizeMB,
 		MaxBackups:  cfg.LogMaxBackups,
 		ConsoleText: cfg.LogText,
-	})
+	}
+	log, closer, err := logging.New(logOpts)
+	var logFileErr error
+	if err != nil && logOpts.File != "" {
+		// Файл лога недоступен (например, нет прав на папку) — это не повод не запускать
+		// бота: продолжаем с логами только в консоль и громко сообщаем об этом ниже.
+		logFileErr, logOpts.File = err, ""
+		log, closer, err = logging.New(logOpts)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "init logging: %v\n", err)
 		return err
 	}
 	defer closer.Close()
+	if logFileErr != nil {
+		log.Error("log file is unavailable, logging to console only", "file", cfg.LogFile, "err", logFileErr)
+	}
 	slog.SetDefault(log)
 	// Фатальная ошибка попадает и в файл лога: defer выполняется до closer.Close().
 	defer func() {
@@ -57,7 +68,7 @@ func run(syncOnce bool) (err error) {
 			log.Error("fatal", "err", err)
 		}
 	}()
-	log.Info("logging configured", "file", cfg.LogFile, "log_level", cfg.LogLevel.String(), "dump_dir", cfg.DumpDir)
+	log.Info("logging configured", "file", logOpts.File, "log_level", cfg.LogLevel.String(), "dump_dir", cfg.DumpDir)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

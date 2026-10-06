@@ -21,11 +21,21 @@ services:
         limits:
           memory: 512m
 
+  # Docker создаёт отсутствующую ./logs от root, и бот (не root) не может в неё писать.
+  # Этот контейнер один раз при старте отдаёт папку пользователю, от которого работает бот.
+  logs-init:
+    image: busybox:1.37
+    user: root
+    command: ["sh", "-c", "mkdir -p /logs/dumps && chown -R ${HOST_UID:-1000}:${HOST_GID:-1000} /logs"]
+    volumes:
+      - ./logs:/logs
+
   bot:
     build: .
     restart: unless-stopped
     env_file: .env
-    # Процесс работает от имени владельца проекта на хосте, чтобы писать в ./logs.
+    # Процесс работает от имени владельца проекта на хосте, чтобы файлы в ./logs
+    # принадлежали ему. На сервере задайте HOST_UID/HOST_GID в .env (id -u / id -g).
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     environment:
       # Внутри compose бот ходит в БД по имени сервиса; DATABASE_URL из .env здесь перекрывается.
@@ -38,6 +48,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      logs-init:
+        condition: service_completed_successfully
     deploy:
       resources:
         limits:
