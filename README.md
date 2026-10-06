@@ -25,8 +25,12 @@ docker compose up -d --build
 docker compose logs -f bot
 ```
 
-Сервер должен иметь доступ к schedule.siriusuniversity.ru (из-за рубежа сайт может не открываться;
-тогда задайте `HTTPS_PROXY`).
+Серверу нужен доступ к двум адресам:
+
+- **schedule.siriusuniversity.ru** — из-за рубежа может не открываться; тогда `HTTPS_PROXY`.
+- **api.telegram.org** — из России может быть недоступен; тогда `TELEGRAM_PROXY`
+  (действует только на Telegram) или `TELEGRAM_API_URL`. Пока Telegram недоступен, бот не падает:
+  повторяет подключение и продолжает обновлять расписание, в логе — `cannot reach telegram bot api`.
 
 Без Docker: поднять PostgreSQL, указать `DATABASE_URL` в `.env`, затем `make run`.
 

@@ -5,9 +5,12 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"html"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -28,6 +31,33 @@ const (
 
 	textError = "😔 Что-то пошло не так. Попробуйте ещё раз чуть позже."
 )
+
+const (
+	// pollTimeout — long polling getUpdates (Telegram держит запрос до pollTimeout-1с).
+	pollTimeout = 50 * time.Second
+	// httpTimeout с запасом больше pollTimeout: у библиотеки по умолчанию запас всего
+	// в секунду, и на медленной сети пустой long poll превращается в ложную ошибку.
+	httpTimeout = pollTimeout + 20*time.Second
+	// initTimeout — на проверку токена (getMe) при старте; по умолчанию у библиотеки 5 с.
+	initTimeout = 30 * time.Second
+)
+
+// ErrAPIUnavailable — не удалось связаться с Telegram Bot API при старте
+// (сеть, блокировка, прокси).
+var ErrAPIUnavailable = errors.New("telegram bot api is unavailable")
+
+// ErrInvalidToken — Telegram отклонил TELEGRAM_TOKEN.
+var ErrInvalidToken = errors.New("telegram rejected the bot token (check TELEGRAM_TOKEN)")
+
+// newHTTPClient — клиент для Telegram. Прокси из TELEGRAM_PROXY действует только здесь,
+// поэтому сайт университета можно продолжать открывать напрямую.
+func newHTTPClient(proxy *url.URL) *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	if proxy != nil {
+		tr.Proxy = http.ProxyURL(proxy)
+	}
+	return &http.Client{Timeout: httpTimeout, Transport: tr}
+}
 
 // ScheduleService — то, что боту нужно от доменного сервиса.
 type ScheduleService interface {
@@ -52,7 +82,10 @@ type Syncer interface {
 }
 
 type Options struct {
-	Token      string
+	Token  string
+	APIURL string   // адрес Bot API; пусто — https://api.telegram.org
+	Proxy  *url.URL // прокси только для Telegram; nil — HTTPS_PROXY из окружения или напрямую
+
 	Location   *time.Location
 	AdminIDs   map[int64]bool
 	AllowedIDs map[int64]bool // пусто — бот открыт для всех
@@ -83,14 +116,24 @@ func New(svc ScheduleService, syn Syncer, opts Options, log *slog.Logger) (*Bot,
 		search: newRateLimiter(3 * time.Second), // каждый поиск — запрос к сайту университета
 	}
 
-	api, err := tg.New(opts.Token,
+	tgOpts := []tg.Option{
 		tg.WithMiddlewares(b.trackInflight, b.logUpdate, b.recoverPanic, b.restrictAccess),
 		tg.WithDefaultHandler(b.handleText),
 		tg.WithErrorsHandler(func(err error) { b.log.Error("telegram polling", "err", err) }),
 		tg.WithAllowedUpdates(tg.AllowedUpdates{"message", "callback_query"}),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("init telegram bot: %w", err)
+		tg.WithHTTPClient(pollTimeout, newHTTPClient(opts.Proxy)),
+		tg.WithCheckInitTimeout(initTimeout),
+	}
+	if opts.APIURL != "" {
+		tgOpts = append(tgOpts, tg.WithServerURL(opts.APIURL))
+	}
+	api, err := tg.New(opts.Token, tgOpts...)
+	switch {
+	case errors.Is(err, tg.ErrorUnauthorized), errors.Is(err, tg.ErrorNotFound):
+		// 401/404 на getMe — неверный токен: повторять бессмысленно.
+		return nil, fmt.Errorf("%w: %w", ErrInvalidToken, err)
+	case err != nil:
+		return nil, fmt.Errorf("%w: %w", ErrAPIUnavailable, err)
 	}
 	b.api = api
 

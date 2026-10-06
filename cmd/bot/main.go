@@ -105,20 +105,11 @@ func run(syncOnce bool) (err error) {
 	if err != nil {
 		return err
 	}
-	bot, err := telegram.New(svc, updater, telegram.Options{
-		Token:      cfg.TelegramToken,
-		Location:   cfg.Location,
-		AdminIDs:   cfg.AdminIDs,
-		AllowedIDs: cfg.AllowedIDs,
+	log.Info("starting", "default_group", cfg.DefaultGroup, "sync_times", cfg.SyncTimes, "timezone", cfg.Location.String())
 
-		StartupMessage: cfg.StartupMessage,
-		SyncTimes:      cfg.SyncTimes,
-	}, log)
-	if err != nil {
-		return err
-	}
-
+	// Синхронизация не зависит от Telegram: стартует сразу, даже если Bot API пока недоступен.
 	var wg sync.WaitGroup
+	defer wg.Wait() // Loop выходит по отмене ctx; идущая синхронизация ограничена своим таймаутом
 	wg.Go(func() {
 		updater.Loop(ctx, syncer.Schedule{
 			Times:    cfg.SyncTimes,
@@ -128,10 +119,58 @@ func run(syncOnce bool) (err error) {
 		})
 	})
 
-	log.Info("starting", "default_group", cfg.DefaultGroup, "sync_times", cfg.SyncTimes, "timezone", cfg.Location.String())
-	bot.Run(ctx, 10*time.Second)
+	bot, err := connectTelegram(ctx, log, func() (*telegram.Bot, error) {
+		return telegram.New(svc, updater, telegram.Options{
+			Token:      cfg.TelegramToken,
+			APIURL:     cfg.TelegramAPIURL,
+			Proxy:      cfg.TelegramProxy,
+			Location:   cfg.Location,
+			AdminIDs:   cfg.AdminIDs,
+			AllowedIDs: cfg.AllowedIDs,
 
-	wg.Wait() // Loop выходит по отмене ctx; идущая синхронизация ограничена своим таймаутом
+			StartupMessage: cfg.StartupMessage,
+			SyncTimes:      cfg.SyncTimes,
+		}, log)
+	})
+	if err != nil {
+		return err
+	}
+	if bot != nil { // nil — остановили до того, как Telegram стал доступен
+		bot.Run(ctx, 10*time.Second)
+	}
+
 	log.Info("shutdown complete")
 	return nil
+}
+
+// connectTelegram повторяет подключение к Bot API, пока оно не удастся или не отменят ctx.
+// Недоступный Telegram (сеть, блокировка) — не повод падать в рестарт-луп: процесс
+// живёт, расписание продолжает обновляться, а в логе видно, в чём дело.
+func connectTelegram(ctx context.Context, log *slog.Logger, connect func() (*telegram.Bot, error)) (*telegram.Bot, error) {
+	delay := 5 * time.Second
+	for attempt := 1; ; attempt++ {
+		bot, err := connect()
+		if err == nil {
+			if attempt > 1 {
+				log.Info("connected to telegram", "attempt", attempt)
+			}
+			return bot, nil
+		}
+		if !errors.Is(err, telegram.ErrAPIUnavailable) {
+			return nil, err
+		}
+		log.Error("cannot reach telegram bot api, will retry",
+			"attempt", attempt, "retry_in", delay.String(), "err", err,
+			"hint", "check that the server can reach api.telegram.org (curl https://api.telegram.org), "+
+				"or set TELEGRAM_PROXY / TELEGRAM_API_URL")
+
+		t := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return nil, nil
+		case <-t.C:
+		}
+		delay = min(delay*2, 2*time.Minute)
+	}
 }

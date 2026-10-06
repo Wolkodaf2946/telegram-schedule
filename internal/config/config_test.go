@@ -81,3 +81,33 @@ func TestLoad_ReportsAllErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestLoad_TelegramNetwork(t *testing.T) {
+	base := map[string]string{"TELEGRAM_TOKEN": "t", "DATABASE_URL": "x"}
+
+	cfg, err := Load(env(base))
+	if err != nil || cfg.TelegramAPIURL != "https://api.telegram.org" || cfg.TelegramProxy != nil {
+		t.Fatalf("defaults: %+v, %v", cfg, err)
+	}
+
+	m := map[string]string{"TELEGRAM_API_URL": "https://tg.example.org/", "TELEGRAM_PROXY": "socks5://user:secret@10.0.0.1:1080"}
+	for k, v := range base {
+		m[k] = v
+	}
+	cfg, err = Load(env(m))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TelegramAPIURL != "https://tg.example.org" || cfg.TelegramProxy.Host != "10.0.0.1:1080" {
+		t.Errorf("api url %q, proxy %v", cfg.TelegramAPIURL, cfg.TelegramProxy)
+	}
+
+	m["TELEGRAM_PROXY"] = "ftp://user:secret@10.0.0.1"
+	_, err = Load(env(m))
+	if err == nil || !strings.Contains(err.Error(), "TELEGRAM_PROXY") {
+		t.Fatalf("expected TELEGRAM_PROXY error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "secret") {
+		t.Error("proxy password must not leak into error text")
+	}
+}

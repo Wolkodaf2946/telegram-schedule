@@ -17,7 +17,13 @@ import (
 
 type Config struct {
 	TelegramToken string
-	DatabaseURL   string
+	// TelegramAPIURL — адрес Bot API: официальный или свой (self-hosted telegram-bot-api, зеркало).
+	TelegramAPIURL string
+	// TelegramProxy — прокси только для запросов к Telegram (http, https, socks5, socks5h).
+	// nil — напрямую (или через HTTPS_PROXY из окружения).
+	TelegramProxy *url.URL
+
+	DatabaseURL string
 
 	DefaultGroup string // группа для новых пользователей, например «ИОП-ИТ-24/2»
 	ScheduleURL  string
@@ -53,13 +59,29 @@ func Load(getenv func(string) string) (Config, error) {
 	var errs []error
 
 	cfg := Config{
-		TelegramToken: get("TELEGRAM_TOKEN", ""),
-		DatabaseURL:   get("DATABASE_URL", ""),
-		DefaultGroup:  get("DEFAULT_GROUP", "ИОП-ИТ-24/2"),
-		ScheduleURL:   get("SCHEDULE_URL", "https://schedule.siriusuniversity.ru"),
+		TelegramToken:  get("TELEGRAM_TOKEN", ""),
+		TelegramAPIURL: strings.TrimRight(get("TELEGRAM_API_URL", "https://api.telegram.org"), "/"),
+		DatabaseURL:    get("DATABASE_URL", ""),
+		DefaultGroup:   get("DEFAULT_GROUP", "ИОП-ИТ-24/2"),
+		ScheduleURL:    get("SCHEDULE_URL", "https://schedule.siriusuniversity.ru"),
 	}
 	if cfg.TelegramToken == "" {
 		errs = append(errs, errors.New("TELEGRAM_TOKEN is required"))
+	}
+	if u, err := url.Parse(cfg.TelegramAPIURL); err != nil || u.Scheme == "" || u.Host == "" {
+		errs = append(errs, fmt.Errorf("TELEGRAM_API_URL: invalid url %q", cfg.TelegramAPIURL))
+	}
+	if p := get("TELEGRAM_PROXY", ""); p != "" {
+		u, err := url.Parse(p)
+		switch {
+		case err != nil || u.Host == "":
+			// Текст значения не выводим: в нём может быть пароль прокси.
+			errs = append(errs, errors.New("TELEGRAM_PROXY: invalid url"))
+		case !slices.Contains([]string{"http", "https", "socks5", "socks5h"}, u.Scheme):
+			errs = append(errs, fmt.Errorf("TELEGRAM_PROXY: unsupported scheme %q (use http, https, socks5, socks5h)", u.Scheme))
+		default:
+			cfg.TelegramProxy = u
+		}
 	}
 	if cfg.DatabaseURL == "" {
 		errs = append(errs, errors.New("DATABASE_URL is required"))
