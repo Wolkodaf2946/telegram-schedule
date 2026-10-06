@@ -41,7 +41,10 @@ services:
       # Внутри compose бот ходит в БД по имени сервиса; DATABASE_URL из .env здесь перекрывается.
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
       LOG_FILE: /logs/bot.log
+      USERS_LOG_FILE: /logs/users.log
       DUMP_DIR: /logs/dumps
+      # Время в логах — по часовому поясу университета, а не UTC.
+      TZ: ${TIMEZONE:-Europe/Moscow}
     volumes:
       # JSON-лог и дампы непонятых ответов сайта доступны на хосте в ./logs.
       - ./logs:/logs

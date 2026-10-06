@@ -127,12 +127,10 @@ func (f *fakeSearcher) SearchGroups(_ context.Context, q string) ([]string, erro
 
 func newService(t *testing.T, repo *fakeRepo, s GroupSearcher) *Service {
 	t.Helper()
-	svc, err := NewService(context.Background(), repo, s, "ИОП-ИТ-24/2", time.UTC)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return svc
+	return NewService(repo, s, time.UTC)
 }
+
+var testGroup = Group{ID: 1, Name: "ИОП-ИТ-24/2"}
 
 func TestServiceDay(t *testing.T) {
 	repo := newFakeRepo()
@@ -142,7 +140,7 @@ func TestServiceDay(t *testing.T) {
 		UpdatedAt: time.Now(),
 	}
 	svc := newService(t, repo, &fakeSearcher{})
-	g := svc.DefaultGroup()
+	g := testGroup
 
 	day, err := svc.Day(context.Background(), g, time.Date(2026, 10, 6, 15, 0, 0, 0, time.UTC))
 	if err != nil || !day.Known || !day.Date.Equal(time.Date(2026, 10, 6, 0, 0, 0, 0, time.UTC)) {
@@ -163,7 +161,7 @@ func TestServiceDay(t *testing.T) {
 
 func TestServiceMonthDays(t *testing.T) {
 	svc := newService(t, newFakeRepo(), &fakeSearcher{})
-	days, err := svc.MonthDays(context.Background(), svc.DefaultGroup(), time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC))
+	days, err := svc.MonthDays(context.Background(), testGroup, time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC))
 	if err != nil || len(days) != 2 || !days[1] || !days[15] {
 		t.Errorf("MonthDays = %v, %v", days, err)
 	}
@@ -175,10 +173,9 @@ func TestServiceUserGroups(t *testing.T) {
 	searcher := &fakeSearcher{names: []string{"С06ББ-25/1", "С06ББ-25/2"}}
 	svc := newService(t, repo, searcher)
 
-	// Новый пользователь получает группу по умолчанию.
-	g, err := svc.UserGroup(ctx, 42)
-	if err != nil || g.Name != "ИОП-ИТ-24/2" || g.ID == 0 {
-		t.Fatalf("default group: %+v, %v", g, err)
+	// У нового пользователя группы нет — её нужно выбрать.
+	if _, ok, err := svc.UserGroup(ctx, 42); ok || err != nil {
+		t.Fatalf("new user must have no group: ok=%v err=%v", ok, err)
 	}
 
 	found, err := svc.SearchGroups(ctx, "  ББ-25  ")
@@ -192,11 +189,12 @@ func TestServiceUserGroups(t *testing.T) {
 	if _, err := svc.SelectGroup(ctx, 42, found[1].ID); err != nil {
 		t.Fatal(err)
 	}
-	if g, _ := svc.UserGroup(ctx, 42); g.Name != "С06ББ-25/2" {
-		t.Errorf("selected group = %+v", g)
+	// Выбор виден сразу, несмотря на кеш «группа не выбрана» выше.
+	if g, ok, _ := svc.UserGroup(ctx, 42); !ok || g.Name != "С06ББ-25/2" {
+		t.Errorf("selected group = %+v, ok=%v", g, ok)
 	}
-	if g, _ := svc.UserGroup(ctx, 7); g.Name != "ИОП-ИТ-24/2" {
-		t.Errorf("other users keep default group, got %+v", g)
+	if _, ok, _ := svc.UserGroup(ctx, 7); ok {
+		t.Error("other users are not affected")
 	}
 
 	if _, err := svc.SelectGroup(ctx, 42, 999); !errors.Is(err, ErrGroupNotFound) {
@@ -204,5 +202,44 @@ func TestServiceUserGroups(t *testing.T) {
 	}
 	if _, err := svc.SearchGroups(ctx, "И"); !errors.Is(err, ErrQueryTooShort) {
 		t.Errorf("short query err = %v", err)
+	}
+}
+
+// countingRepo считает обращения к БД, чтобы проверить кеши сервиса.
+type countingRepo struct {
+	*fakeRepo
+	groupByID, userGroup int
+}
+
+func (c *countingRepo) GroupByID(ctx context.Context, id int64) (Group, error) {
+	c.groupByID++
+	return c.fakeRepo.GroupByID(ctx, id)
+}
+
+func (c *countingRepo) UserGroup(ctx context.Context, id int64) (Group, bool, error) {
+	c.userGroup++
+	return c.fakeRepo.UserGroup(ctx, id)
+}
+
+func TestServiceCaches(t *testing.T) {
+	ctx := context.Background()
+	repo := &countingRepo{fakeRepo: newFakeRepo()}
+	svc := NewService(repo, &fakeSearcher{names: []string{"A", "B"}}, time.UTC)
+
+	found, _ := svc.SearchGroups(ctx, "AB")
+	for range 3 {
+		if g, err := svc.GroupByID(ctx, found[1].ID); err != nil || g.Name != "B" {
+			t.Fatalf("GroupByID = %+v, %v", g, err)
+		}
+	}
+	if repo.groupByID != 0 {
+		t.Errorf("groups found by search must be served from cache, got %d DB calls", repo.groupByID)
+	}
+
+	for range 3 {
+		_, _, _ = svc.UserGroup(ctx, 1)
+	}
+	if repo.userGroup != 1 {
+		t.Errorf("UserGroup hit DB %d times, want 1", repo.userGroup)
 	}
 }

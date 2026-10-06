@@ -18,13 +18,15 @@ make run | make sync | make test-db | make errors
 
 ## Архитектура
 
-Зависимости идут только к домену: `telegram`, `syncer`, `storage/postgres`, `scraper` → `schedule`.
+Зависимости идут только к домену: `telegram`, `syncer`, `storage/postgres`, `scraper` →
+`schedule`, `users`.
 
 ```
-cmd/bot/main.go           конфиг → логи → БД (+миграции) → scraper → syncer → service → telegram
-internal/config           env → Config, все ошибки сразу (errors.Join)
-internal/logging          slog: консоль + JSON-файл с ротацией; логгер апдейта в ctx
-internal/schedule         домен: Lesson, Clock, Group, Service (чтение, выбор группы, поиск)
+cmd/bot/main.go           конфиг → логи → БД (+миграции) → scraper → syncer → сервисы → telegram
+internal/config           env → Config, все ошибки сразу (errors.Join), Warnings — некритичное
+internal/logging          slog: консоль + JSON-файл с ротацией; логгер апдейта в ctx; NewJournal
+internal/schedule         домен: Lesson, Clock, Group, Service (чтение, выбор группы, поиск; кеши)
+internal/users            пользователи и доступ: Touch, заявки, статусы, журнал users.log
 internal/scraper          клиент Livewire + парсер HTML, дампы непонятых ответов
 internal/syncer           RunGroup/RunAll (блокировка на группу), Loop по SYNC_TIMES
 internal/storage/postgres pgx/v5, миграции goose вшиты (migrations/embed.go)
@@ -36,8 +38,12 @@ internal/telegram         go-telegram/bot: middleware, хендлеры, кал�
 - Ошибки — sentinel + `errors.Is`. Единственное сравнение по строке — `isNotModified`
   (ответ Telegram API).
 - Callback-данные строятся и разбираются только в [callback.go](internal/telegram/callback.go):
-  `day:<gid>:YYYY-MM-DD`, `cal:<gid>:YYYY-MM`, `grp:<gid>`, `noop`. Лимит 64 байта, поэтому
-  в кнопке id группы, а не название.
+  `day:<gid>:YYYY-MM-DD`, `cal:<gid>:YYYY-MM`, `grp:<gid>`, `acc:<uid>:a|r`, `noop`. Лимит
+  64 байта, поэтому в кнопке id группы, а не название.
+- Доступ проверяет middleware `checkAccess` (до всех хендлеров); админские команды оборачиваются
+  в `adminOnly`. Админ-хендлеры — в [admin.go](internal/telegram/admin.go).
+- Скорость: каждый запрос к Telegram дорогой (у пользователя прокси, ~1 с). Одно сообщение на
+  команду, `answerAsync` для callback, выбор группы — редактирование, а не новые сообщения.
 - Логи в хендлерах — через `b.logger(ctx)`: в нём уже есть update_id/user_id/chat_id.
 - Пользователь идентифицируется по `From.ID` (`senderID`), сообщения шлются в `Chat.ID`.
 - Даты — `time.Time` в полночь UTC (`schedule.DateOf`), в БД — `DATE`; время пары — `schedule.Clock`.
@@ -68,5 +74,7 @@ internal/telegram         go-telegram/bot: middleware, хендлеры, кал�
 - `lessons` заменяются атомарно по диапазону месяцев группы (`ReplaceLessons`).
 - `sync_runs` — журнал; по успешным строкам считается покрытие (`Coverage`): дата вне его —
   «данных нет», внутри без пар — «пар нет».
-- `groups` (справочник, id для кнопок), `users` (выбранная группа; нет строки — `DEFAULT_GROUP`).
-- Обновляются `DEFAULT_GROUP` + все группы из `users`.
+- `groups` — справочник, id для кнопок.
+- `users` — все, кто писал боту: профиль, `status` (active/pending/blocked), `group_id`
+  (NULL — группа не выбрана, группы по умолчанию нет).
+- Обновляются только группы пользователей со `status = 'active'` (`TrackedGroups`).

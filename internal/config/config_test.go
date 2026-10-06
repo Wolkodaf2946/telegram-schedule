@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"telegram-schedule/internal/schedule"
+	"telegram-schedule/internal/users"
 )
 
 func env(m map[string]string) func(string) string {
@@ -19,8 +20,11 @@ func TestLoad_Defaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.DefaultGroup != "ИОП-ИТ-24/2" || cfg.Location.String() != "Europe/Moscow" || cfg.MonthsAhead != 1 {
+	if cfg.Location.String() != "Europe/Moscow" || cfg.MonthsAhead != 1 || cfg.AccessMode != users.ModeOpen {
 		t.Errorf("unexpected defaults: %+v", cfg)
+	}
+	if cfg.UsersLogFile != "logs/users.log" || len(cfg.Warnings) != 0 {
+		t.Errorf("users log = %q, warnings = %v", cfg.UsersLogFile, cfg.Warnings)
 	}
 	if len(cfg.SyncTimes) != 1 || cfg.SyncTimes[0] != 6*60 {
 		t.Errorf("default sync times = %v, want [06:00]", cfg.SyncTimes)
@@ -109,5 +113,37 @@ func TestLoad_TelegramNetwork(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "secret") {
 		t.Error("proxy password must not leak into error text")
+	}
+}
+
+func TestLoad_Access(t *testing.T) {
+	base := func(extra map[string]string) map[string]string {
+		m := map[string]string{"TELEGRAM_TOKEN": "t", "DATABASE_URL": "x"}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return m
+	}
+
+	cfg, err := Load(env(base(map[string]string{"ACCESS_MODE": "Approval", "ADMIN_IDS": "1", "ALLOWED_USER_IDS": "2,3"})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AccessMode != users.ModeApproval || !cfg.AllowedIDs[3] {
+		t.Errorf("access: %v %v", cfg.AccessMode, cfg.AllowedIDs)
+	}
+
+	// Режим по заявкам без администраторов бессмыслен: заявки некому одобрять.
+	if _, err := Load(env(base(map[string]string{"ACCESS_MODE": "approval"}))); err == nil || !strings.Contains(err.Error(), "ADMIN_IDS") {
+		t.Errorf("approval without admins: err = %v", err)
+	}
+	if _, err := Load(env(base(map[string]string{"ACCESS_MODE": "private"}))); err == nil || !strings.Contains(err.Error(), "ACCESS_MODE") {
+		t.Errorf("bad mode: err = %v", err)
+	}
+
+	// Устаревшая переменная — предупреждение, а не ошибка запуска.
+	cfg, err = Load(env(base(map[string]string{"DEFAULT_GROUP": "ИОП-ИТ-24/2", "USERS_LOG_FILE": "off"})))
+	if err != nil || len(cfg.Warnings) != 1 || cfg.UsersLogFile != "" {
+		t.Errorf("DEFAULT_GROUP: err=%v warnings=%v users log=%q", err, cfg.Warnings, cfg.UsersLogFile)
 	}
 }

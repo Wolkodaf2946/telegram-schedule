@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"strings"
+	"sync"
 	"time"
 
 	"telegram-schedule/internal/schedule"
@@ -31,6 +33,13 @@ type Scraper struct {
 	ua      string
 	log     *slog.Logger
 	dumpDir string
+
+	searchMu     sync.Mutex // одна тёплая сессия — поиски идут по очереди
+	searchSess   *session
+	searchOpened time.Time
+
+	cacheMu     sync.Mutex
+	searchCache map[string]searchEntry
 }
 
 type Options struct {
@@ -59,6 +68,8 @@ func New(baseURL string, opts Options) (*Scraper, error) {
 		ua:      defaultUserAgent,
 		log:     opts.Logger.With("component", "scraper"),
 		dumpDir: opts.DumpDir,
+
+		searchCache: make(map[string]searchEntry),
 	}, nil
 }
 
@@ -101,17 +112,84 @@ func (s *Scraper) Fetch(ctx context.Context, group string, monthsAhead int) (mon
 // Если найдено ровно столько, запрос стоит уточнить.
 const MaxSearchResults = 20
 
+const (
+	// searchCacheTTL — список групп меняется раз в семестр; час — с большим запасом.
+	searchCacheTTL = time.Hour
+	// searchSessionTTL — сессию Laravel переоткрываем заранее, не дожидаясь её
+	// истечения на сервере (по умолчанию 2 часа).
+	searchSessionTTL = 30 * time.Minute
+)
+
 // SearchGroups ищет группы по части названия так же, как поле поиска на сайте.
-func (s *Scraper) SearchGroups(ctx context.Context, query string) (groups []string, err error) {
-	sess, err := s.newSession(ctx)
-	defer func() { s.dumpOnError(sess, "search "+query, err) }()
+//
+// Чтобы поиск был быстрым:
+//   - результаты кешируются на searchCacheTTL — повторный запрос не идёт на сайт;
+//   - для поиска держится одна «тёплая» сессия сайта. Открытие сессии — это
+//     GET /list на ~550 КБ, а сам поиск — POST на ~40 КБ. Сессия переоткрывается
+//     по возрасту или после ошибки (например, 419 — истёк CSRF).
+func (s *Scraper) SearchGroups(ctx context.Context, query string) ([]string, error) {
+	key := strings.ToLower(query)
+	if groups, ok := s.cachedSearch(key); ok {
+		s.log.Debug("group search cache hit", "query", query)
+		return groups, nil
+	}
+
+	s.searchMu.Lock()
+	defer s.searchMu.Unlock()
+
+	groups, err := s.searchWarm(ctx, query)
+	if err != nil && ctx.Err() == nil {
+		// Сессия могла протухнуть на стороне сайта — одна попытка с новой.
+		s.log.Info("group search failed, retrying with a fresh session", "err", err)
+		s.searchSess = nil
+		groups, err = s.searchWarm(ctx, query)
+	}
 	if err != nil {
+		s.searchSess = nil
 		return nil, err
 	}
+
+	s.cacheMu.Lock()
+	if len(s.searchCache) > 1000 {
+		clear(s.searchCache)
+	}
+	s.searchCache[key] = searchEntry{groups: groups, at: time.Now()}
+	s.cacheMu.Unlock()
+	return groups, nil
+}
+
+// searchWarm выполняет поиск в тёплой сессии; вызывается под searchMu.
+func (s *Scraper) searchWarm(ctx context.Context, query string) (groups []string, err error) {
+	if s.searchSess == nil || time.Since(s.searchOpened) > searchSessionTTL {
+		sess, err := s.newSession(ctx)
+		if err != nil {
+			s.dumpOnError(sess, "search "+query, err)
+			return nil, err
+		}
+		s.searchSess, s.searchOpened = sess, time.Now()
+	}
+	sess := s.searchSess
+	defer func() { s.dumpOnError(sess, "search "+query, err) }()
+
 	if err := sess.input(ctx, "search", query); err != nil {
 		return nil, fmt.Errorf("search groups: %w", err)
 	}
 	return parseGroups(sess.comp.html)
+}
+
+type searchEntry struct {
+	groups []string
+	at     time.Time
+}
+
+func (s *Scraper) cachedSearch(key string) ([]string, bool) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	e, ok := s.searchCache[key]
+	if !ok || time.Since(e.at) > searchCacheTTL {
+		return nil, false
+	}
+	return e.groups, true
 }
 
 // newSession открывает страницу расписания в свежей сессии.

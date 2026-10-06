@@ -13,6 +13,7 @@ import (
 //	day:<group_id>:2026-10-06   показать расписание группы на день
 //	cal:<group_id>:2026-10      показать календарь группы на месяц
 //	grp:<group_id>              выбрать группу
+//	acc:<user_id>:a|r           администратор одобряет (a) или отклоняет (r) заявку на доступ
 //	noop                        кнопка-заглушка (пустая клетка, заголовок)
 //
 // Группа зашита в кнопку, поэтому старое сообщение продолжает листать ту группу,
@@ -26,6 +27,7 @@ const (
 	actionDay      action = "day"
 	actionCalendar action = "cal"
 	actionGroup    action = "grp"
+	actionAccess   action = "acc"
 	actionNoop     action = "noop"
 )
 
@@ -33,8 +35,18 @@ var errBadCallback = errors.New("malformed callback data")
 
 type callback struct {
 	action  action
-	groupID int64
+	groupID int64     // для day, cal, grp
 	date    time.Time // для day — дата, для cal — первое число месяца
+	userID  int64     // для acc
+	approve bool      // для acc
+}
+
+func accessData(userID int64, approve bool) string {
+	decision := "r"
+	if approve {
+		decision = "a"
+	}
+	return fmt.Sprintf("%s:%d:%s", actionAccess, userID, decision)
 }
 
 func dayData(groupID int64, date time.Time) string {
@@ -66,6 +78,11 @@ func parseCallback(data string) (callback, error) {
 	cb := callback{action: action(parts[0]), groupID: id}
 
 	switch cb.action {
+	case actionAccess:
+		if len(parts) != 3 || (parts[2] != "a" && parts[2] != "r") {
+			return bad()
+		}
+		return callback{action: actionAccess, userID: id, approve: parts[2] == "a"}, nil
 	case actionGroup:
 		if len(parts) != 2 {
 			return bad()

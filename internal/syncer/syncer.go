@@ -36,44 +36,36 @@ type Result struct {
 }
 
 type Syncer struct {
-	fetcher      Fetcher
-	store        Store
-	defaultGroup string
-	monthsAhead  int
-	timeout      time.Duration // на одну группу
-	pause        time.Duration // между группами, чтобы не долбить сайт
-	log          *slog.Logger
-	now          func() time.Time
+	fetcher     Fetcher
+	store       Store
+	monthsAhead int
+	timeout     time.Duration // на одну группу
+	pause       time.Duration // между группами, чтобы не долбить сайт
+	log         *slog.Logger
+	now         func() time.Time
 
 	mu     sync.Mutex
 	active map[string]bool // группы, которые синхронизируются прямо сейчас
 }
 
-func New(f Fetcher, s Store, defaultGroup string, monthsAhead int, log *slog.Logger) *Syncer {
+func New(f Fetcher, s Store, monthsAhead int, log *slog.Logger) *Syncer {
 	return &Syncer{
-		fetcher:      f,
-		store:        s,
-		defaultGroup: defaultGroup,
-		monthsAhead:  monthsAhead,
-		timeout:      5 * time.Minute,
-		pause:        2 * time.Second,
-		log:          log.With("component", "syncer"),
-		now:          time.Now,
-		active:       make(map[string]bool),
+		fetcher:     f,
+		store:       s,
+		monthsAhead: monthsAhead,
+		timeout:     5 * time.Minute,
+		pause:       2 * time.Second,
+		log:         log.With("component", "syncer"),
+		now:         time.Now,
+		active:      make(map[string]bool),
 	}
 }
 
-// Groups — что обновлять: группа по умолчанию и все группы, выбранные пользователями.
+// Groups — что обновлять: группы, выбранные пользователями с доступом.
 func (s *Syncer) Groups(ctx context.Context) ([]string, error) {
-	tracked, err := s.store.TrackedGroups(ctx)
+	groups, err := s.store.TrackedGroups(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get tracked groups: %w", err)
-	}
-	groups := []string{s.defaultGroup}
-	for _, g := range tracked {
-		if g != s.defaultGroup {
-			groups = append(groups, g)
-		}
 	}
 	return groups, nil
 }

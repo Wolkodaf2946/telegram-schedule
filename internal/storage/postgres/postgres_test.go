@@ -8,7 +8,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/pressly/goose/v3"
+
 	"telegram-schedule/internal/schedule"
+	"telegram-schedule/internal/users"
+	"telegram-schedule/migrations"
 )
 
 // Интеграционные тесты идут на настоящем Postgres и запускаются, только если задан
@@ -168,5 +173,86 @@ func TestGroupsAndUsers(t *testing.T) {
 	tracked, err := s.TrackedGroups(ctx)
 	if err != nil || !slices.Equal(tracked, []string{"С06ББ-25/2"}) {
 		t.Errorf("tracked groups = %v, %v", tracked, err)
+	}
+}
+
+func TestUsersAccess(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	p := users.Profile{ID: 100, Username: "student", FirstName: "Иван", LastName: "Петров", LanguageCode: "ru"}
+	u, created, err := s.TouchUser(ctx, p, users.StatusPending)
+	if err != nil || !created || u.Status != users.StatusPending || u.Profile != p || u.GroupName != "" {
+		t.Fatalf("first touch: %+v created=%v err=%v", u, created, err)
+	}
+
+	// Повторное касание обновляет профиль, но не меняет статус и не считается новым.
+	p.Username = "renamed"
+	u, created, err = s.TouchUser(ctx, p, users.StatusActive)
+	if err != nil || created || u.Status != users.StatusPending || u.Username != "renamed" {
+		t.Fatalf("second touch: %+v created=%v err=%v", u, created, err)
+	}
+
+	// Выбор группы до одобрения не делает группу отслеживаемой.
+	groups, _ := s.UpsertGroups(ctx, []string{"ИОП-ИТ-24/2"})
+	if err := s.SetUserGroup(ctx, p.ID, groups[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if tracked, _ := s.TrackedGroups(ctx); len(tracked) != 0 {
+		t.Errorf("groups of pending users must not be synced, got %v", tracked)
+	}
+
+	u, err = s.SetUserStatus(ctx, p.ID, users.StatusActive)
+	if err != nil || u.Status != users.StatusActive || u.GroupName != "ИОП-ИТ-24/2" {
+		t.Fatalf("approve: %+v, %v", u, err)
+	}
+	if tracked, _ := s.TrackedGroups(ctx); !slices.Equal(tracked, []string{"ИОП-ИТ-24/2"}) {
+		t.Errorf("tracked after approval = %v", tracked)
+	}
+	if _, err := s.SetUserStatus(ctx, 999, users.StatusActive); !errors.Is(err, users.ErrUserNotFound) {
+		t.Errorf("unknown user err = %v", err)
+	}
+
+	// В списке ожидающие идут первыми.
+	if _, _, err := s.TouchUser(ctx, users.Profile{ID: 200}, users.StatusPending); err != nil {
+		t.Fatal(err)
+	}
+	list, err := s.ListUsers(ctx, 10)
+	if err != nil || len(list) != 2 || list[0].ID != 200 || list[0].Status != users.StatusPending {
+		t.Errorf("list = %+v, %v", list, err)
+	}
+}
+
+// Пользователи, выбравшие группу до появления статусов доступа (миграция 3),
+// после обновления должны остаться с доступом и своей группой.
+func TestMigration3KeepsExistingUsers(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	db := stdlib.OpenDBFromPool(s.pool)
+	defer db.Close()
+	provider, err := goose.NewProvider(goose.DialectPostgres, db, migrations.FS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.DownTo(ctx, 2); err != nil {
+		t.Fatalf("down to v2: %v", err)
+	}
+	t.Cleanup(func() { _, _ = provider.Up(ctx) }) // вернуть схему для остальных тестов
+
+	var groupID int64
+	if err := s.pool.QueryRow(ctx, `INSERT INTO groups (name) VALUES ('ИОП-ИТ-24/2') RETURNING id`).Scan(&groupID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx, `INSERT INTO users (user_id, group_id) VALUES (1246713334, $1)`, groupID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := provider.Up(ctx); err != nil {
+		t.Fatalf("up to latest: %v", err)
+	}
+	u, created, err := s.TouchUser(ctx, users.Profile{ID: 1246713334, Username: "me"}, users.StatusPending)
+	if err != nil || created || u.Status != users.StatusActive || u.GroupName != "ИОП-ИТ-24/2" {
+		t.Errorf("existing user after upgrade: %+v created=%v err=%v", u, created, err)
 	}
 }

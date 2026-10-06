@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"telegram-schedule/internal/schedule"
+	"telegram-schedule/internal/users"
 )
 
 type Config struct {
@@ -25,9 +26,8 @@ type Config struct {
 
 	DatabaseURL string
 
-	DefaultGroup string // группа для новых пользователей, например «ИОП-ИТ-24/2»
-	ScheduleURL  string
-	MonthsAhead  int // сколько месяцев после текущего загружать
+	ScheduleURL string
+	MonthsAhead int // сколько месяцев после текущего загружать
 
 	Location    *time.Location   // часовой пояс университета: «сегодня» и время синхронизации
 	SyncTimes   []schedule.Clock // когда обновлять расписание; пусто — только вручную
@@ -35,8 +35,13 @@ type Config struct {
 
 	StartupMessage bool // при запуске написать администраторам, что бот работает
 
-	AdminIDs   map[int64]bool // могут вызывать /refresh
-	AllowedIDs map[int64]bool // если не пусто — бот отвечает только им
+	// AccessMode: open — бот для всех; approval — новых пользователей одобряет администратор.
+	AccessMode users.Mode
+	AdminIDs   map[int64]bool // одобряют заявки, управляют доступом, /refresh
+	AllowedIDs map[int64]bool // в режиме approval получают доступ без заявки
+
+	// UsersLogFile — отдельный журнал пользователей (новые, заявки, решения). Пусто — не вести.
+	UsersLogFile string
 
 	LogLevel      slog.Level
 	LogFile       string // JSON-лог в файл; пусто — только консоль
@@ -46,6 +51,9 @@ type Config struct {
 	// DumpDir — куда сохранять сырые ответы сайта, которые не удалось разобрать.
 	// Пусто — не сохранять.
 	DumpDir string
+
+	// Warnings — некритичные замечания к конфигу (устаревшие переменные и т. п.).
+	Warnings []string
 }
 
 // Load собирает конфиг. getenv передаётся параметром, чтобы тестировать без os.Setenv.
@@ -62,7 +70,6 @@ func Load(getenv func(string) string) (Config, error) {
 		TelegramToken:  get("TELEGRAM_TOKEN", ""),
 		TelegramAPIURL: strings.TrimRight(get("TELEGRAM_API_URL", "https://api.telegram.org"), "/"),
 		DatabaseURL:    get("DATABASE_URL", ""),
-		DefaultGroup:   get("DEFAULT_GROUP", "ИОП-ИТ-24/2"),
 		ScheduleURL:    get("SCHEDULE_URL", "https://schedule.siriusuniversity.ru"),
 	}
 	if cfg.TelegramToken == "" {
@@ -115,6 +122,22 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	if cfg.AllowedIDs, err = parseIDs(get("ALLOWED_USER_IDS", "")); err != nil {
 		errs = append(errs, fmt.Errorf("ALLOWED_USER_IDS: %w", err))
+	}
+	switch m := users.Mode(strings.ToLower(get("ACCESS_MODE", "open"))); m {
+	case users.ModeOpen, users.ModeApproval:
+		cfg.AccessMode = m
+		if m == users.ModeApproval && len(cfg.AdminIDs) == 0 {
+			errs = append(errs, errors.New("ACCESS_MODE=approval needs ADMIN_IDS: someone has to approve requests"))
+		}
+	default:
+		errs = append(errs, fmt.Errorf("ACCESS_MODE must be open or approval, got %q", m))
+	}
+	if get("DEFAULT_GROUP", "") != "" {
+		cfg.Warnings = append(cfg.Warnings, "DEFAULT_GROUP is ignored: users choose a group themselves; remove it from .env")
+	}
+	cfg.UsersLogFile = get("USERS_LOG_FILE", "logs/users.log")
+	if strings.EqualFold(cfg.UsersLogFile, "off") {
+		cfg.UsersLogFile = ""
 	}
 
 	if err := cfg.LogLevel.UnmarshalText([]byte(get("LOG_LEVEL", "info"))); err != nil {

@@ -43,6 +43,9 @@ type fakeSite struct {
 	searchHTML  string            // ответ на ввод в поле поиска
 	status      int               // если не 0 — ответ на любой POST
 
+	pageLoads, posts int  // сколько раз открывали /list и слали Livewire-запросы
+	failNextPost     bool // следующий POST получит 419 (истёкшая сессия)
+
 	mu       sync.Mutex
 	requests []map[string]json.RawMessage
 }
@@ -50,6 +53,9 @@ type fakeSite struct {
 func (f *fakeSite) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/list":
+		f.mu.Lock()
+		f.pageLoads++
+		f.mu.Unlock()
 		http.SetCookie(w, &http.Cookie{Name: "session", Value: "s1"})
 		io.WriteString(w, f.page)
 	case r.Method == http.MethodPost && r.URL.Path == "/livewire/message/main":
@@ -61,8 +67,13 @@ func (f *fakeSite) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (f *fakeSite) handleMessage(w http.ResponseWriter, r *http.Request) {
 	t := f.t
-	if f.status != 0 {
-		w.WriteHeader(f.status)
+	f.mu.Lock()
+	f.posts++
+	failNext := f.failNextPost
+	f.failNextPost = false
+	f.mu.Unlock()
+	if f.status != 0 || failNext {
+		w.WriteHeader(max(f.status, 419))
 		return
 	}
 	if r.Header.Get("X-Livewire") != "true" || r.Header.Get("X-CSRF-TOKEN") != "test-csrf-token" {
@@ -110,7 +121,7 @@ func (f *fakeSite) handleMessage(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	if up := updates[0]; up.Type == "syncInput" {
-		if up.Payload.Name != "search" || up.Payload.Value != "ио" {
+		if up.Payload.Name != "search" {
 			t.Errorf("unexpected input %+v", up.Payload)
 		}
 		writeReply(w, f.searchHTML, `{"htmlHash":"h4","data":{"search":"ио","groupList":[]},"checksum":"c-search"}`)
@@ -278,5 +289,36 @@ func TestFetch_NetworkErrorIsNotDumped(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
 		t.Errorf("network errors must not produce dumps, got %d files", len(entries))
+	}
+}
+
+func TestSearchGroups_CacheAndWarmSession(t *testing.T) {
+	f, s := newFake(t)
+	ctx := context.Background()
+
+	for _, q := range []string{"ио", "ИО", "ио"} { // регистр не важен — один ключ кеша
+		if _, err := s.SearchGroups(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if f.pageLoads != 1 || f.posts != 1 {
+		t.Errorf("repeated query: %d page loads, %d posts; want 1 and 1 (cache)", f.pageLoads, f.posts)
+	}
+
+	// Новый запрос идёт на сайт, но в уже открытой сессии — без повторной загрузки /list.
+	if _, err := s.SearchGroups(ctx, "ББ"); err != nil {
+		t.Fatal(err)
+	}
+	if f.pageLoads != 1 || f.posts != 2 {
+		t.Errorf("new query: %d page loads, %d posts; want 1 and 2 (warm session)", f.pageLoads, f.posts)
+	}
+
+	// Сессия истекла на стороне сайта (419) — поиск переоткрывает её и повторяет запрос.
+	f.failNextPost = true
+	if groups, err := s.SearchGroups(ctx, "ИОП"); err != nil || len(groups) == 0 {
+		t.Fatalf("search after session expiry: %v, %v", groups, err)
+	}
+	if f.pageLoads != 2 {
+		t.Errorf("expired session must be reopened once, got %d page loads", f.pageLoads)
 	}
 }

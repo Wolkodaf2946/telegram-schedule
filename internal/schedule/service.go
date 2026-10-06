@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -78,54 +79,94 @@ type Day struct {
 
 // Service — расписание и выбор групп. Принимает и возвращает доменные типы:
 // построение сообщений и клавиатур живёт в транспортном слое.
+//
+// Группы и выбор пользователей кешируются в памяти: это справочные данные, которые
+// меняются только через этот же сервис, а запрашиваются на каждое нажатие кнопки.
 type Service struct {
-	repo         Repository
-	searcher     GroupSearcher
-	defaultGroup Group
-	loc          *time.Location
-	now          func() time.Time
+	repo     Repository
+	searcher GroupSearcher
+	loc      *time.Location
+	now      func() time.Time
+
+	mu         sync.RWMutex
+	groups     map[int64]Group     // id -> группа; группы неизменяемы
+	userGroups map[int64]userGroup // выбор пользователя, включая «не выбрано»
 }
 
-// NewService регистрирует группу по умолчанию в справочнике (ей нужен id для кнопок).
-func NewService(ctx context.Context, repo Repository, searcher GroupSearcher, defaultGroup string, loc *time.Location) (*Service, error) {
-	groups, err := repo.UpsertGroups(ctx, []string{defaultGroup})
-	if err != nil {
-		return nil, fmt.Errorf("register default group: %w", err)
+type userGroup struct {
+	group Group
+	ok    bool
+}
+
+func NewService(repo Repository, searcher GroupSearcher, loc *time.Location) *Service {
+	return &Service{
+		repo: repo, searcher: searcher, loc: loc, now: time.Now,
+		groups:     make(map[int64]Group),
+		userGroups: make(map[int64]userGroup),
 	}
-	return &Service{repo: repo, searcher: searcher, defaultGroup: groups[0], loc: loc, now: time.Now}, nil
 }
-
-func (s *Service) DefaultGroup() Group { return s.defaultGroup }
 
 // Today — сегодняшняя дата в часовом поясе университета.
 func (s *Service) Today() time.Time { return DateOf(s.now().In(s.loc)) }
 
-// UserGroup — группа, выбранная пользователем, или группа по умолчанию.
-func (s *Service) UserGroup(ctx context.Context, userID int64) (Group, error) {
-	g, ok, err := s.repo.UserGroup(ctx, userID)
+// UserGroup — группа, выбранная пользователем; ok=false, если он ещё не выбирал.
+func (s *Service) UserGroup(ctx context.Context, userID int64) (g Group, ok bool, err error) {
+	s.mu.RLock()
+	cached, hit := s.userGroups[userID]
+	s.mu.RUnlock()
+	if hit {
+		return cached.group, cached.ok, nil
+	}
+
+	g, ok, err = s.repo.UserGroup(ctx, userID)
 	if err != nil {
-		return Group{}, fmt.Errorf("get user group: %w", err)
+		return Group{}, false, fmt.Errorf("get user group: %w", err)
 	}
-	if !ok {
-		return s.defaultGroup, nil
-	}
-	return g, nil
+	s.mu.Lock()
+	s.userGroups[userID] = userGroup{group: g, ok: ok}
+	s.mu.Unlock()
+	return g, ok, nil
 }
 
 // SelectGroup запоминает выбор пользователя.
 func (s *Service) SelectGroup(ctx context.Context, userID, groupID int64) (Group, error) {
-	g, err := s.repo.GroupByID(ctx, groupID)
+	g, err := s.GroupByID(ctx, groupID)
 	if err != nil {
 		return Group{}, err
 	}
 	if err := s.repo.SetUserGroup(ctx, userID, g.ID); err != nil {
 		return Group{}, fmt.Errorf("set user group: %w", err)
 	}
+	s.mu.Lock()
+	s.userGroups[userID] = userGroup{group: g, ok: true}
+	s.mu.Unlock()
 	return g, nil
 }
 
 func (s *Service) GroupByID(ctx context.Context, id int64) (Group, error) {
-	return s.repo.GroupByID(ctx, id)
+	s.mu.RLock()
+	g, ok := s.groups[id]
+	s.mu.RUnlock()
+	if ok {
+		return g, nil
+	}
+
+	g, err := s.repo.GroupByID(ctx, id)
+	if err != nil {
+		return Group{}, err
+	}
+	s.rememberGroups(g)
+	return g, nil
+}
+
+func (s *Service) rememberGroups(groups ...Group) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, g := range groups {
+		if g.ID != 0 {
+			s.groups[g.ID] = g
+		}
+	}
 }
 
 // SearchGroups ищет группы на сайте и заносит найденные в справочник.
@@ -145,6 +186,7 @@ func (s *Service) SearchGroups(ctx context.Context, query string) ([]Group, erro
 	if err != nil {
 		return nil, fmt.Errorf("save groups: %w", err)
 	}
+	s.rememberGroups(groups...)
 	return groups, nil
 }
 

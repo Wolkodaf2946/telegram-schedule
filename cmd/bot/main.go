@@ -20,6 +20,7 @@ import (
 	"telegram-schedule/internal/storage/postgres"
 	"telegram-schedule/internal/syncer"
 	"telegram-schedule/internal/telegram"
+	"telegram-schedule/internal/users"
 )
 
 func main() {
@@ -69,6 +70,18 @@ func run(syncOnce bool) (err error) {
 		}
 	}()
 	log.Info("logging configured", "file", logOpts.File, "log_level", cfg.LogLevel.String(), "dump_dir", cfg.DumpDir)
+	for _, w := range cfg.Warnings {
+		log.Warn("config: " + w)
+	}
+
+	// Журнал пользователей — отдельный файл (новые пользователи, заявки, решения админа);
+	// каждая запись дублируется и в основной лог.
+	journal, journalCloser, err := logging.NewJournal(cfg.UsersLogFile, cfg.LogMaxSizeMB, cfg.LogMaxBackups, log.With("component", "users"))
+	if err != nil {
+		log.Error("users log file is unavailable, users are logged to the main log only", "file", cfg.UsersLogFile, "err", err)
+		journal, journalCloser, _ = logging.NewJournal("", 0, 0, log.With("component", "users"))
+	}
+	defer journalCloser.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -85,7 +98,7 @@ func run(syncOnce bool) (err error) {
 	if err != nil {
 		return err
 	}
-	updater := syncer.New(scr, store, cfg.DefaultGroup, cfg.MonthsAhead, log)
+	updater := syncer.New(scr, store, cfg.MonthsAhead, log)
 
 	if syncOnce {
 		results, err := updater.RunAll(ctx)
@@ -101,11 +114,14 @@ func run(syncOnce bool) (err error) {
 		return errors.Join(errs...)
 	}
 
-	svc, err := schedule.NewService(ctx, store, scr, cfg.DefaultGroup, cfg.Location)
-	if err != nil {
-		return err
-	}
-	log.Info("starting", "default_group", cfg.DefaultGroup, "sync_times", cfg.SyncTimes, "timezone", cfg.Location.String())
+	svc := schedule.NewService(store, scr, cfg.Location)
+	usersSvc := users.NewService(store, users.Options{
+		Mode:        cfg.AccessMode,
+		Admins:      cfg.AdminIDs,
+		Preapproved: cfg.AllowedIDs,
+		Journal:     journal,
+	})
+	log.Info("starting", "access_mode", string(cfg.AccessMode), "sync_times", cfg.SyncTimes, "timezone", cfg.Location.String())
 
 	// Синхронизация не зависит от Telegram: стартует сразу, даже если Bot API пока недоступен.
 	var wg sync.WaitGroup
@@ -120,13 +136,12 @@ func run(syncOnce bool) (err error) {
 	})
 
 	bot, err := connectTelegram(ctx, log, func() (*telegram.Bot, error) {
-		return telegram.New(svc, updater, telegram.Options{
-			Token:      cfg.TelegramToken,
-			APIURL:     cfg.TelegramAPIURL,
-			Proxy:      cfg.TelegramProxy,
-			Location:   cfg.Location,
-			AdminIDs:   cfg.AdminIDs,
-			AllowedIDs: cfg.AllowedIDs,
+		return telegram.New(svc, updater, usersSvc, telegram.Options{
+			Token:    cfg.TelegramToken,
+			APIURL:   cfg.TelegramAPIURL,
+			Proxy:    cfg.TelegramProxy,
+			Location: cfg.Location,
+			AdminIDs: cfg.AdminIDs,
 
 			StartupMessage: cfg.StartupMessage,
 			SyncTimes:      cfg.SyncTimes,

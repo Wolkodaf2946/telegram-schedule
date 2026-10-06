@@ -21,6 +21,7 @@ import (
 	"telegram-schedule/internal/logging"
 	"telegram-schedule/internal/schedule"
 	"telegram-schedule/internal/syncer"
+	"telegram-schedule/internal/users"
 )
 
 const (
@@ -51,20 +52,27 @@ var ErrInvalidToken = errors.New("telegram rejected the bot token (check TELEGRA
 
 // newHTTPClient — клиент для Telegram. Прокси из TELEGRAM_PROXY действует только здесь,
 // поэтому сайт университета можно продолжать открывать напрямую.
+//
+// Каждый запрос к Telegram через медленный прокси стоит сотни миллисекунд, а новое
+// TLS-соединение — ещё несколько обменов сверху. Поэтому соединения держатся открытыми
+// долго, а HTTP/2 позволяет отправлять ответы по тому же соединению, на котором
+// висит long polling, — без нового рукопожатия на каждое сообщение.
 func newHTTPClient(proxy *url.URL) *http.Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	if proxy != nil {
 		tr.Proxy = http.ProxyURL(proxy)
 	}
+	tr.ForceAttemptHTTP2 = true
+	tr.MaxIdleConnsPerHost = 16
+	tr.IdleConnTimeout = 15 * time.Minute
 	return &http.Client{Timeout: httpTimeout, Transport: tr}
 }
 
-// ScheduleService — то, что боту нужно от доменного сервиса.
+// ScheduleService — то, что боту нужно от доменного сервиса расписания.
 type ScheduleService interface {
-	DefaultGroup() schedule.Group
 	Today() time.Time
 
-	UserGroup(ctx context.Context, userID int64) (schedule.Group, error)
+	UserGroup(ctx context.Context, userID int64) (g schedule.Group, ok bool, err error)
 	SelectGroup(ctx context.Context, userID, groupID int64) (schedule.Group, error)
 	GroupByID(ctx context.Context, id int64) (schedule.Group, error)
 	SearchGroups(ctx context.Context, query string) ([]schedule.Group, error)
@@ -81,14 +89,22 @@ type Syncer interface {
 	RunGroup(ctx context.Context, group string) syncer.Result
 }
 
+// UsersService — учёт пользователей и доступ к боту.
+type UsersService interface {
+	Mode() users.Mode
+	IsAdmin(id int64) bool
+	Touch(ctx context.Context, p users.Profile) (u users.User, created bool, err error)
+	SetStatus(ctx context.Context, adminID, userID int64, status users.Status) (users.User, error)
+	List(ctx context.Context, limit int) ([]users.User, error)
+}
+
 type Options struct {
 	Token  string
 	APIURL string   // адрес Bot API; пусто — https://api.telegram.org
 	Proxy  *url.URL // прокси только для Telegram; nil — HTTPS_PROXY из окружения или напрямую
 
-	Location   *time.Location
-	AdminIDs   map[int64]bool
-	AllowedIDs map[int64]bool // пусто — бот открыт для всех
+	Location *time.Location
+	AdminIDs map[int64]bool // кому слать заявки, «Бот запущен» и уведомления о новых пользователях
 
 	// StartupMessage — при запуске написать администраторам, что бот работает.
 	// Только им: рассылка всем пользователям на каждый рестарт — это спам
@@ -101,23 +117,25 @@ type Bot struct {
 	api      *tg.Bot
 	svc      ScheduleService
 	sync     Syncer
+	users    UsersService
 	opts     Options
 	log      *slog.Logger
 	inflight sync.WaitGroup
 	search   *rateLimiter
 }
 
-func New(svc ScheduleService, syn Syncer, opts Options, log *slog.Logger) (*Bot, error) {
+func New(svc ScheduleService, syn Syncer, usr UsersService, opts Options, log *slog.Logger) (*Bot, error) {
 	b := &Bot{
 		svc:    svc,
 		sync:   syn,
+		users:  usr,
 		opts:   opts,
 		log:    log.With("component", "telegram"),
 		search: newRateLimiter(3 * time.Second), // каждый поиск — запрос к сайту университета
 	}
 
 	tgOpts := []tg.Option{
-		tg.WithMiddlewares(b.trackInflight, b.logUpdate, b.recoverPanic, b.restrictAccess),
+		tg.WithMiddlewares(b.trackInflight, b.logUpdate, b.recoverPanic, b.checkAccess),
 		tg.WithDefaultHandler(b.handleText),
 		tg.WithErrorsHandler(func(err error) { b.log.Error("telegram polling", "err", err) }),
 		tg.WithAllowedUpdates(tg.AllowedUpdates{"message", "callback_query"}),
@@ -144,7 +162,10 @@ func New(svc ScheduleService, syn Syncer, opts Options, log *slog.Logger) (*Bot,
 		"tomorrow": b.handleTomorrow,
 		"calendar": b.handleCalendar,
 		"group":    b.handleGroup,
-		"refresh":  b.handleRefresh,
+		"refresh":  b.adminOnly(b.handleRefresh),
+		"users":    b.adminOnly(b.handleUsers),
+		"allow":    b.adminOnly(b.handleAllow),
+		"revoke":   b.adminOnly(b.handleRevoke),
 	} {
 		// CommandStartOnly, а не Command: последний режет текст по UTF-16-смещениям
 		// из entities как по байтам и ошибается, если перед командой есть кириллица.
@@ -184,7 +205,7 @@ func (b *Bot) setCommands(ctx context.Context) {
 		{Command: "today", Description: "Расписание на сегодня"},
 		{Command: "tomorrow", Description: "Расписание на завтра"},
 		{Command: "calendar", Description: "Выбрать день в календаре"},
-		{Command: "group", Description: "Сменить группу"},
+		{Command: "group", Description: "Выбрать группу"},
 		{Command: "help", Description: "Что умеет бот"},
 	}})
 	if err != nil {
@@ -273,23 +294,86 @@ func (b *Bot) recoverPanic(next tg.HandlerFunc) tg.HandlerFunc {
 	}
 }
 
-// restrictAccess пропускает только пользователей из ALLOWED_USER_IDS, если он задан.
-func (b *Bot) restrictAccess(next tg.HandlerFunc) tg.HandlerFunc {
+// checkAccess учитывает пользователя (новых — в журнал и администраторам) и пропускает
+// к обработчикам только тех, у кого есть доступ. В открытом режиме доступ есть у всех.
+func (b *Bot) checkAccess(next tg.HandlerFunc) tg.HandlerFunc {
 	return func(ctx context.Context, api *tg.Bot, u *models.Update) {
-		if len(b.opts.AllowedIDs) == 0 {
-			next(ctx, api, u)
+		p, ok := profileOf(u)
+		if !ok {
+			return // апдейт без отправителя (например, от канала) — не наш случай
+		}
+		user, created, err := b.users.Touch(ctx, p)
+		if err != nil {
+			b.logger(ctx).Error("touch user", "err", err)
+			if b.users.Mode() == users.ModeOpen {
+				next(ctx, api, u) // открытый бот не должен ломаться из-за журнала
+			} else {
+				b.reply(ctx, u, textError)
+			}
 			return
 		}
-		userID := senderID(u)
-		if b.opts.AllowedIDs[userID] {
-			next(ctx, api, u)
-			return
+		if created {
+			b.goTracked(func() { b.announceNewUser(context.WithoutCancel(ctx), user) })
 		}
-		b.logger(ctx).Warn("access denied")
-		if u.CallbackQuery != nil {
-			b.answerCallback(ctx, u.CallbackQuery.ID, "Нет доступа")
+
+		switch user.Status {
+		case users.StatusActive:
+			next(ctx, api, u)
+		case users.StatusPending:
+			b.logger(ctx).Info("access pending")
+			b.reply(ctx, u, "⏳ Заявка на доступ отправлена администратору. Как только её одобрят, я напишу.")
+		default:
+			b.logger(ctx).Info("access denied", "status", string(user.Status))
+			b.reply(ctx, u, "⛔ Доступ к боту закрыт.")
 		}
 	}
+}
+
+// adminOnly пропускает к обработчику только администраторов.
+func (b *Bot) adminOnly(h tg.HandlerFunc) tg.HandlerFunc {
+	return func(ctx context.Context, api *tg.Bot, u *models.Update) {
+		if !b.users.IsAdmin(senderID(u)) {
+			b.reply(ctx, u, "Эта команда доступна только администратору.")
+			return
+		}
+		h(ctx, api, u)
+	}
+}
+
+// goTracked запускает фоновую работу так, чтобы остановка бота её дождалась.
+func (b *Bot) goTracked(f func()) {
+	b.inflight.Add(1)
+	go func() {
+		defer b.inflight.Done()
+		f()
+	}()
+}
+
+// reply — короткий ответ на апдейт: всплывашка для кнопки, сообщение для текста.
+func (b *Bot) reply(ctx context.Context, u *models.Update, text string) {
+	switch {
+	case u.CallbackQuery != nil:
+		b.answerCallback(ctx, u.CallbackQuery.ID, text)
+	case u.Message != nil:
+		b.send(ctx, u.Message.Chat.ID, text, nil)
+	}
+}
+
+func profileOf(u *models.Update) (users.Profile, bool) {
+	var from *models.User
+	switch {
+	case u.Message != nil:
+		from = u.Message.From
+	case u.CallbackQuery != nil:
+		from = &u.CallbackQuery.From
+	}
+	if from == nil || from.ID == 0 {
+		return users.Profile{}, false
+	}
+	return users.Profile{
+		ID: from.ID, Username: from.Username, FirstName: from.FirstName,
+		LastName: from.LastName, LanguageCode: from.LanguageCode,
+	}, true
 }
 
 // --- helpers ---

@@ -45,6 +45,26 @@ func New(opts Options) (*slog.Logger, io.Closer, error) {
 	return slog.New(slog.NewMultiHandler(console, file)), w, nil
 }
 
+// NewJournal — отдельный журнал событий (например, пользователей) в JSON-файл с ротацией.
+// Каждая запись дублируется в mirror (основной лог), если он задан, чтобы события были
+// видны и в общей ленте. path пустой — журнал пишется только в mirror.
+func NewJournal(path string, maxSizeMB, maxBackups int, mirror *slog.Logger) (*slog.Logger, io.Closer, error) {
+	var handlers []slog.Handler
+	if mirror != nil {
+		handlers = append(handlers, mirror.Handler())
+	}
+	closer := io.Closer(io.NopCloser(nil))
+	if path != "" {
+		w, err := NewRotatingFile(path, int64(maxSizeMB)<<20, maxBackups)
+		if err != nil {
+			return nil, nil, err
+		}
+		handlers = append(handlers, slog.NewJSONHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		closer = w
+	}
+	return slog.New(slog.NewMultiHandler(handlers...)), closer, nil
+}
+
 type ctxKey struct{}
 
 // WithLogger кладёт в ctx логгер с полями текущего запроса (update_id, user_id, ...).

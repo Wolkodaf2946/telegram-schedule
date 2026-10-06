@@ -90,6 +90,11 @@ func (b *Bot) editOrSend(ctx context.Context, msg models.MaybeInaccessibleMessag
 	}
 }
 
+// answerAsync отвечает на callback в фоне — параллельно с основной работой обработчика.
+func (b *Bot) answerAsync(ctx context.Context, id, text string) {
+	b.goTracked(func() { b.answerCallback(ctx, id, text) })
+}
+
 func (b *Bot) answerCallback(ctx context.Context, id, text string) {
 	_, err := b.api.AnswerCallbackQuery(ctx, &tg.AnswerCallbackQueryParams{CallbackQueryID: id, Text: text})
 	if err != nil {

@@ -164,7 +164,7 @@ func TestRunGroup_ReplacesWholeRange(t *testing.T) {
 		{First: nov}, // пустой месяц тоже должен очистить старые данные
 	}}
 	st := newFakeStore()
-	res := New(f, st, "G", 1, discard()).RunGroup(context.Background(), "G")
+	res := New(f, st, 1, discard()).RunGroup(context.Background(), "G")
 	if res.Err != nil {
 		t.Fatal(res.Err)
 	}
@@ -179,7 +179,7 @@ func TestRunGroup_ReplacesWholeRange(t *testing.T) {
 func TestRunGroup_FetchErrorKeepsOldData(t *testing.T) {
 	st := newFakeStore()
 	f := &fakeFetcher{errFor: map[string]error{"G": scraper.ErrCountMismatch}}
-	res := New(f, st, "G", 0, discard()).RunGroup(context.Background(), "G")
+	res := New(f, st, 0, discard()).RunGroup(context.Background(), "G")
 	if !errors.Is(res.Err, scraper.ErrCountMismatch) {
 		t.Fatalf("err = %v", res.Err)
 	}
@@ -193,25 +193,25 @@ func TestRunGroup_FetchErrorKeepsOldData(t *testing.T) {
 
 func TestRunAll_OneGroupFailureDoesNotStopOthers(t *testing.T) {
 	st := newFakeStore()
-	st.tracked = []string{"A", "DEF", "B"} // группа по умолчанию тоже выбрана кем-то
+	st.tracked = []string{"A", "B", "C"}
 	f := &fakeFetcher{
 		months: []scraper.Month{{First: october}},
 		errFor: map[string]error{"A": errors.New("site is down")},
 	}
-	s := New(f, st, "DEF", 0, discard())
+	s := New(f, st, 0, discard())
 	s.pause = 0
 
 	results, err := s.RunAll(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := f.fetched; len(got) != 3 || got[0] != "DEF" || got[1] != "A" || got[2] != "B" {
-		t.Errorf("fetched %v, want [DEF A B] without duplicates", got)
+	if got := f.fetched; len(got) != 3 || got[0] != "A" || got[1] != "B" || got[2] != "C" {
+		t.Errorf("fetched %v, want [A B C]", got)
 	}
-	if results[1].Err == nil || results[0].Err != nil || results[2].Err != nil {
+	if results[0].Err == nil || results[1].Err != nil || results[2].Err != nil {
 		t.Errorf("results = %+v", results)
 	}
-	if !st.replaced["DEF"] || !st.replaced["B"] || st.replaced["A"] {
+	if !st.replaced["B"] || !st.replaced["C"] || st.replaced["A"] {
 		t.Errorf("replaced = %v", st.replaced)
 	}
 	if !anyFailed(results) {
@@ -221,7 +221,7 @@ func TestRunAll_OneGroupFailureDoesNotStopOthers(t *testing.T) {
 
 func TestRunGroup_NoConcurrentRunsOfSameGroup(t *testing.T) {
 	f := &fakeFetcher{block: make(chan struct{}), months: []scraper.Month{{First: october}}}
-	s := New(f, newFakeStore(), "G", 0, discard())
+	s := New(f, newFakeStore(), 0, discard())
 
 	done := make(chan Result)
 	go func() { done <- s.RunGroup(context.Background(), "G") }()
@@ -243,4 +243,12 @@ func (s *Syncer) isActive(group string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.active[group]
+}
+
+func TestRunAll_NoGroups(t *testing.T) {
+	f := &fakeFetcher{}
+	results, err := New(f, newFakeStore(), 0, discard()).RunAll(context.Background())
+	if err != nil || len(results) != 0 || len(f.fetched) != 0 {
+		t.Errorf("no tracked groups must mean no requests to the site: %v %v %v", results, err, f.fetched)
+	}
 }

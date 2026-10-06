@@ -9,6 +9,7 @@ import (
 	"github.com/go-telegram/bot/models"
 
 	"telegram-schedule/internal/schedule"
+	"telegram-schedule/internal/users"
 )
 
 func d(y int, m time.Month, day int) time.Time { return time.Date(y, m, day, 0, 0, 0, 0, time.UTC) }
@@ -257,5 +258,41 @@ func TestUpdateAttrs(t *testing.T) {
 	}})
 	if cb["kind"] != "callback" || cb["data"] != "day:1:2026-10-06" || cb["chat_id"] != int64(200) || cb["user_id"] != int64(8) {
 		t.Errorf("callback attrs = %v", cb)
+	}
+}
+
+func TestAccessCallback(t *testing.T) {
+	cb, err := parseCallback(accessData(1246713334, true))
+	if err != nil || cb.action != actionAccess || cb.userID != 1246713334 || !cb.approve {
+		t.Fatalf("approve: %+v, %v", cb, err)
+	}
+	cb, err = parseCallback(accessData(5, false))
+	if err != nil || cb.approve {
+		t.Fatalf("reject: %+v, %v", cb, err)
+	}
+	for _, bad := range []string{"acc:5", "acc:5:x", "acc:0:a", "acc:5:a:1"} {
+		if _, err := parseCallback(bad); !errors.Is(err, errBadCallback) {
+			t.Errorf("parseCallback(%q) err = %v", bad, err)
+		}
+	}
+}
+
+func TestUserCardEscapesHTML(t *testing.T) {
+	u := users.User{Profile: users.Profile{ID: 7, FirstName: "<b>Хакер</b>", Username: "h&k", LanguageCode: "ru"}, GroupName: "ИОП-ИТ-24/2"}
+	card := userCard(u)
+	for _, want := range []string{"&lt;b&gt;Хакер&lt;/b&gt;", "@h&amp;k", "<code>7</code>", "язык: ru", "Группа: ИОП-ИТ-24/2"} {
+		if !strings.Contains(card, want) {
+			t.Errorf("card missing %q:\n%s", want, card)
+		}
+	}
+}
+
+func TestProfileOf(t *testing.T) {
+	p, ok := profileOf(&models.Update{CallbackQuery: &models.CallbackQuery{From: models.User{ID: 3, Username: "x", LanguageCode: "ru"}}})
+	if !ok || p.ID != 3 || p.Username != "x" || p.LanguageCode != "ru" {
+		t.Errorf("callback profile = %+v, %v", p, ok)
+	}
+	if _, ok := profileOf(&models.Update{Message: &models.Message{}}); ok {
+		t.Error("message without sender has no profile")
 	}
 }

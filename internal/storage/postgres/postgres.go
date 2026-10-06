@@ -14,6 +14,7 @@ import (
 	"github.com/pressly/goose/v3"
 
 	"telegram-schedule/internal/schedule"
+	"telegram-schedule/internal/users"
 	"telegram-schedule/migrations"
 )
 
@@ -260,11 +261,12 @@ func (s *Store) SetUserGroup(ctx context.Context, userID, groupID int64) error {
 	return err
 }
 
-// TrackedGroups — группы, выбранные хотя бы одним пользователем: их и обновляем.
+// TrackedGroups — группы, выбранные хотя бы одним пользователем с доступом: их и обновляем.
 func (s *Store) TrackedGroups(ctx context.Context) ([]string, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT g.name
 		FROM users u JOIN groups g ON g.id = u.group_id
+		WHERE u.status = 'active'
 		ORDER BY g.name`)
 	if err != nil {
 		return nil, err
@@ -272,5 +274,77 @@ func (s *Store) TrackedGroups(ctx context.Context) ([]string, error) {
 	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
-// Проверка на этапе компиляции, что Store реализует нужный сервису интерфейс.
-var _ schedule.Repository = (*Store)(nil)
+const userColumns = `u.user_id, u.username, u.first_name, u.last_name, u.language_code,
+	u.status, coalesce(g.name, ''), u.created_at, u.last_seen_at`
+
+// scanUser читает колонки userColumns и, после них, extra.
+func scanUser(row pgx.Row, extra ...any) (users.User, error) {
+	var (
+		u      users.User
+		status string
+	)
+	dest := append([]any{&u.ID, &u.Username, &u.FirstName, &u.LastName, &u.LanguageCode,
+		&status, &u.GroupName, &u.FirstSeen, &u.LastSeen}, extra...)
+	err := row.Scan(dest...)
+	u.Status = users.Status(status)
+	return u, err
+}
+
+// TouchUser создаёт пользователя или обновляет профиль и last_seen существующего.
+// Статус существующего пользователя не меняется.
+func (s *Store) TouchUser(ctx context.Context, p users.Profile, status users.Status) (users.User, bool, error) {
+	var created bool
+	row := s.pool.QueryRow(ctx, `
+		WITH u AS (
+			INSERT INTO users (user_id, username, first_name, last_name, language_code, status)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (user_id) DO UPDATE SET
+				username = EXCLUDED.username, first_name = EXCLUDED.first_name,
+				last_name = EXCLUDED.last_name, language_code = EXCLUDED.language_code,
+				last_seen_at = now()
+			RETURNING *, (xmax = 0) AS inserted -- xmax = 0 только у вставленной строки
+		)
+		SELECT `+userColumns+`, u.inserted
+		FROM u LEFT JOIN groups g ON g.id = u.group_id`,
+		p.ID, p.Username, p.FirstName, p.LastName, p.LanguageCode, string(status),
+	)
+	u, err := scanUser(row, &created)
+	return u, created, err
+}
+
+func (s *Store) SetUserStatus(ctx context.Context, id int64, status users.Status) (users.User, error) {
+	row := s.pool.QueryRow(ctx, `
+		WITH u AS (
+			UPDATE users SET status = $2, updated_at = now() WHERE user_id = $1 RETURNING *
+		)
+		SELECT `+userColumns+`
+		FROM u LEFT JOIN groups g ON g.id = u.group_id`,
+		id, string(status),
+	)
+	u, err := scanUser(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return users.User{}, users.ErrUserNotFound
+	}
+	return u, err
+}
+
+// ListUsers — последние активные пользователи, сначала ожидающие одобрения.
+func (s *Store) ListUsers(ctx context.Context, limit int) ([]users.User, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+userColumns+`
+		FROM users u LEFT JOIN groups g ON g.id = u.group_id
+		ORDER BY u.status = 'pending' DESC, u.last_seen_at DESC
+		LIMIT $1`,
+		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (users.User, error) { return scanUser(row) })
+}
+
+// Проверка на этапе компиляции, что Store реализует нужные сервисам интерфейсы.
+var (
+	_ schedule.Repository = (*Store)(nil)
+	_ users.Repository    = (*Store)(nil)
+)
