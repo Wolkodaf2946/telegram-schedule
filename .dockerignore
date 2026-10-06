@@ -1,0 +1,8 @@
+.env
+.env.*
+*.har
+.git
+.github
+telegram-bot-sleep
+**/testdata
+logs
