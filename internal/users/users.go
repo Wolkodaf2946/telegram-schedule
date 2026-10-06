@@ -64,7 +64,21 @@ type Repository interface {
 	// активности существующего (его статус не меняется). created — пользователь новый.
 	TouchUser(ctx context.Context, p Profile, status Status) (u User, created bool, err error)
 	SetUserStatus(ctx context.Context, id int64, status Status) (User, error) // ErrUserNotFound
-	ListUsers(ctx context.Context, limit int) ([]User, error)
+	GetUser(ctx context.Context, id int64) (User, error)                      // ErrUserNotFound
+	UsersPage(ctx context.Context, status Status, offset, limit int) ([]User, error)
+	CountUsers(ctx context.Context) (map[Status]int, error)
+}
+
+// PageSize — пользователей на одной странице админ-панели.
+const PageSize = 8
+
+// Page — страница списка пользователей одного статуса.
+type Page struct {
+	Status Status
+	Number int // с нуля
+	Total  int // всего страниц, не меньше 1
+	Users  []User
+	Counts map[Status]int // для вкладок панели
 }
 
 type Options struct {
@@ -139,8 +153,30 @@ func (s *Service) SetStatus(ctx context.Context, adminID, userID int64, status S
 	return u, nil
 }
 
-func (s *Service) List(ctx context.Context, limit int) ([]User, error) {
-	return s.repo.ListUsers(ctx, limit)
+// Page возвращает страницу пользователей со статусом status. Номер страницы
+// приводится к допустимому диапазону: после бана последнего человека на странице
+// панель покажет предыдущую, а не пустую.
+func (s *Service) Page(ctx context.Context, status Status, number int) (Page, error) {
+	counts, err := s.repo.CountUsers(ctx)
+	if err != nil {
+		return Page{}, fmt.Errorf("count users: %w", err)
+	}
+	total := max(1, (counts[status]+PageSize-1)/PageSize)
+	number = min(max(number, 0), total-1)
+
+	list, err := s.repo.UsersPage(ctx, status, number*PageSize, PageSize)
+	if err != nil {
+		return Page{}, fmt.Errorf("users page: %w", err)
+	}
+	return Page{Status: status, Number: number, Total: total, Users: list, Counts: counts}, nil
+}
+
+func (s *Service) Counts(ctx context.Context) (map[Status]int, error) {
+	return s.repo.CountUsers(ctx)
+}
+
+func (s *Service) Get(ctx context.Context, id int64) (User, error) {
+	return s.repo.GetUser(ctx, id)
 }
 
 func (s *Service) initialStatus(id int64) Status {

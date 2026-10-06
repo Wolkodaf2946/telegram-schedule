@@ -29,6 +29,7 @@ const (
 	btnTomorrow = "➡️ Завтра"
 	btnCalendar = "📆 Календарь"
 	btnGroup    = "👥 Группа"
+	btnAdmin    = "🛠 Админ-панель"
 
 	textError = "😔 Что-то пошло не так. Попробуйте ещё раз чуть позже."
 )
@@ -95,7 +96,9 @@ type UsersService interface {
 	IsAdmin(id int64) bool
 	Touch(ctx context.Context, p users.Profile) (u users.User, created bool, err error)
 	SetStatus(ctx context.Context, adminID, userID int64, status users.Status) (users.User, error)
-	List(ctx context.Context, limit int) ([]users.User, error)
+	Get(ctx context.Context, id int64) (users.User, error)
+	Page(ctx context.Context, status users.Status, number int) (users.Page, error)
+	Counts(ctx context.Context) (map[users.Status]int, error)
 }
 
 type Options struct {
@@ -162,10 +165,8 @@ func New(svc ScheduleService, syn Syncer, usr UsersService, opts Options, log *s
 		"tomorrow": b.handleTomorrow,
 		"calendar": b.handleCalendar,
 		"group":    b.handleGroup,
+		"admin":    b.adminOnly(b.handleAdmin),
 		"refresh":  b.adminOnly(b.handleRefresh),
-		"users":    b.adminOnly(b.handleUsers),
-		"allow":    b.adminOnly(b.handleAllow),
-		"revoke":   b.adminOnly(b.handleRevoke),
 	} {
 		// CommandStartOnly, а не Command: последний режет текст по UTF-16-смещениям
 		// из entities как по байтам и ошибается, если перед командой есть кириллица.
@@ -175,6 +176,7 @@ func New(svc ScheduleService, syn Syncer, usr UsersService, opts Options, log *s
 	api.RegisterHandler(tg.HandlerTypeMessageText, btnTomorrow, tg.MatchTypeExact, b.handleTomorrow)
 	api.RegisterHandler(tg.HandlerTypeMessageText, btnCalendar, tg.MatchTypeExact, b.handleCalendar)
 	api.RegisterHandler(tg.HandlerTypeMessageText, btnGroup, tg.MatchTypeExact, b.handleGroup)
+	api.RegisterHandler(tg.HandlerTypeMessageText, btnAdmin, tg.MatchTypeExact, b.adminOnly(b.handleAdmin))
 	api.RegisterHandler(tg.HandlerTypeCallbackQueryData, "", tg.MatchTypePrefix, b.handleCallback)
 
 	return b, nil
@@ -378,15 +380,16 @@ func profileOf(u *models.Update) (users.Profile, bool) {
 
 // --- helpers ---
 
-func mainKeyboard() *models.ReplyKeyboardMarkup {
-	return &models.ReplyKeyboardMarkup{
-		Keyboard: [][]models.KeyboardButton{
-			{{Text: btnToday}, {Text: btnTomorrow}},
-			{{Text: btnCalendar}, {Text: btnGroup}},
-		},
-		ResizeKeyboard: true,
-		IsPersistent:   true,
+// mainKeyboard — постоянная клавиатура внизу чата; администратору — с кнопкой панели.
+func (b *Bot) mainKeyboard(userID int64) *models.ReplyKeyboardMarkup {
+	rows := [][]models.KeyboardButton{
+		{{Text: btnToday}, {Text: btnTomorrow}},
+		{{Text: btnCalendar}, {Text: btnGroup}},
 	}
+	if b.users.IsAdmin(userID) {
+		rows = append(rows, []models.KeyboardButton{{Text: btnAdmin}})
+	}
+	return &models.ReplyKeyboardMarkup{Keyboard: rows, ResizeKeyboard: true, IsPersistent: true}
 }
 
 // senderID — пользователь, от которого пришёл апдейт. Данные пользователя

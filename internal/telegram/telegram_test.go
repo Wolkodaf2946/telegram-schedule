@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -294,5 +295,86 @@ func TestProfileOf(t *testing.T) {
 	}
 	if _, ok := profileOf(&models.Update{Message: &models.Message{}}); ok {
 		t.Error("message without sender has no profile")
+	}
+}
+
+func TestAdminCallbacks(t *testing.T) {
+	cases := []struct {
+		data string
+		want callback
+	}{
+		{adminListData(users.StatusPending, 3), callback{action: actionAdmin, adminOp: adminList, tab: users.StatusPending, page: 3}},
+		{adminViewData(users.StatusActive, 0, 42), callback{action: actionAdmin, adminOp: adminView, tab: users.StatusActive, userID: 42}},
+		{adminSetData(users.StatusBlocked, 1, 42, users.StatusActive), callback{action: actionAdmin, adminOp: adminSet, tab: users.StatusBlocked, page: 1, userID: 42, status: users.StatusActive}},
+	}
+	for _, c := range cases {
+		got, err := parseCallback(c.data)
+		if err != nil || got != c.want {
+			t.Errorf("parseCallback(%q) = %+v, %v; want %+v", c.data, got, err, c.want)
+		}
+		if len(c.data) > 64 {
+			t.Errorf("%q is longer than 64 bytes", c.data)
+		}
+	}
+	for _, bad := range []string{"adm", "adm:l:x:0", "adm:l:p:-1", "adm:v:p:0", "adm:v:p:0:0", "adm:s:p:0:5:x", "adm:s:p:0:5", "adm:z:p:0", "noop:1"} {
+		if _, err := parseCallback(bad); !errors.Is(err, errBadCallback) {
+			t.Errorf("parseCallback(%q) err = %v", bad, err)
+		}
+	}
+	// Самая длинная кнопка панели укладывается в лимит Telegram.
+	if s := adminSetData(users.StatusPending, 99_999, 1<<62, users.StatusBlocked); len(s) > 64 {
+		t.Errorf("max admin callback is %d bytes", len(s))
+	}
+}
+
+// fakeUsers — UsersService для тестов отрисовки панели.
+type fakeUsers struct{ admins map[int64]bool }
+
+func (f fakeUsers) Mode() users.Mode      { return users.ModeApproval }
+func (f fakeUsers) IsAdmin(id int64) bool { return f.admins[id] }
+func (f fakeUsers) Touch(context.Context, users.Profile) (users.User, bool, error) {
+	return users.User{}, false, nil
+}
+func (f fakeUsers) SetStatus(context.Context, int64, int64, users.Status) (users.User, error) {
+	return users.User{}, nil
+}
+func (f fakeUsers) Get(context.Context, int64) (users.User, error) { return users.User{}, nil }
+func (f fakeUsers) Page(context.Context, users.Status, int) (users.Page, error) {
+	return users.Page{}, nil
+}
+func (f fakeUsers) Counts(context.Context) (map[users.Status]int, error) { return nil, nil }
+
+func TestRenderAdminPage(t *testing.T) {
+	b := &Bot{users: fakeUsers{admins: map[int64]bool{1: true}}, opts: Options{Location: time.UTC}}
+	page := users.Page{
+		Status: users.StatusActive, Number: 1, Total: 3,
+		Counts: map[users.Status]int{users.StatusPending: 2, users.StatusActive: 20, users.StatusBlocked: 0},
+		Users: []users.User{
+			{Profile: users.Profile{ID: 1, FirstName: "Админ"}, Status: users.StatusActive},
+			{Profile: users.Profile{ID: 7, FirstName: "<Иван>", Username: "ivan"}, Status: users.StatusActive, GroupName: "ИОП-ИТ-24/2"},
+		},
+	}
+	text, kb := b.renderAdminPage(page)
+	rows := kb.InlineKeyboard
+
+	for _, want := range []string{"Доступ: по заявкам", "стр. 2 из 3", "9. Админ", "10. &lt;Иван&gt; @ivan · <code>7</code> · ИОП-ИТ-24/2"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("text missing %q:\n%s", want, text)
+		}
+	}
+	if rows[0][1].Text != "• ✅ Активные 20" || rows[0][0].Text != "⏳ Заявки 2" {
+		t.Errorf("tabs = %q, %q", rows[0][0].Text, rows[0][1].Text)
+	}
+	// Администратора забанить нельзя — вместо кнопки корона.
+	if rows[1][1].Text != "👑" || rows[1][1].CallbackData != noopData() {
+		t.Errorf("admin row = %+v", rows[1])
+	}
+	if rows[2][1].CallbackData != adminSetData(users.StatusActive, 1, 7, users.StatusBlocked) {
+		t.Errorf("ban button = %+v", rows[2][1])
+	}
+	pager := rows[3]
+	if pager[0].CallbackData != adminListData(users.StatusActive, 0) || pager[1].Text != "2 / 3" ||
+		pager[2].CallbackData != adminListData(users.StatusActive, 2) {
+		t.Errorf("pager = %+v", pager)
 	}
 }

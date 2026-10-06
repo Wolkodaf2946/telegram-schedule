@@ -328,19 +328,56 @@ func (s *Store) SetUserStatus(ctx context.Context, id int64, status users.Status
 	return u, err
 }
 
-// ListUsers — последние активные пользователи, сначала ожидающие одобрения.
-func (s *Store) ListUsers(ctx context.Context, limit int) ([]users.User, error) {
+// UsersPage — страница пользователей с данным статусом, недавно активные сверху.
+// Порядок совпадает с индексом users_status_seen_idx, поэтому страница читается
+// по индексу без сортировки.
+func (s *Store) UsersPage(ctx context.Context, status users.Status, offset, limit int) ([]users.User, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT `+userColumns+`
 		FROM users u LEFT JOIN groups g ON g.id = u.group_id
-		ORDER BY u.status = 'pending' DESC, u.last_seen_at DESC
-		LIMIT $1`,
-		limit,
+		WHERE u.status = $1
+		ORDER BY u.last_seen_at DESC, u.user_id DESC
+		OFFSET $2 LIMIT $3`,
+		string(status), offset, limit,
 	)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (users.User, error) { return scanUser(row) })
+}
+
+// CountUsers — число пользователей по статусам (по индексу, без чтения строк).
+func (s *Store) CountUsers(ctx context.Context) (map[users.Status]int, error) {
+	rows, err := s.pool.Query(ctx, `SELECT status, count(*) FROM users GROUP BY status`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	counts := make(map[users.Status]int, 3)
+	for rows.Next() {
+		var (
+			status string
+			n      int
+		)
+		if err := rows.Scan(&status, &n); err != nil {
+			return nil, err
+		}
+		counts[users.Status(status)] = n
+	}
+	return counts, rows.Err()
+}
+
+func (s *Store) GetUser(ctx context.Context, id int64) (users.User, error) {
+	u, err := scanUser(s.pool.QueryRow(ctx, `
+		SELECT `+userColumns+`
+		FROM users u LEFT JOIN groups g ON g.id = u.group_id
+		WHERE u.user_id = $1`,
+		id,
+	))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return users.User{}, users.ErrUserNotFound
+	}
+	return u, err
 }
 
 // Проверка на этапе компиляции, что Store реализует нужные сервисам интерфейсы.

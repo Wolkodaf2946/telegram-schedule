@@ -38,10 +38,13 @@ internal/telegram         go-telegram/bot: middleware, хендлеры, кал�
 - Ошибки — sentinel + `errors.Is`. Единственное сравнение по строке — `isNotModified`
   (ответ Telegram API).
 - Callback-данные строятся и разбираются только в [callback.go](internal/telegram/callback.go):
-  `day:<gid>:YYYY-MM-DD`, `cal:<gid>:YYYY-MM`, `grp:<gid>`, `acc:<uid>:a|r`, `noop`. Лимит
-  64 байта, поэтому в кнопке id группы, а не название.
+  `day:<gid>:YYYY-MM-DD`, `cal:<gid>:YYYY-MM`, `grp:<gid>`, `acc:<uid>:a|r`,
+  `adm:l|v|s:<tab>:<page>[:<uid>[:a|b]]`, `noop`. Лимит 64 байта, поэтому в кнопке id, а не
+  название.
 - Доступ проверяет middleware `checkAccess` (до всех хендлеров); админские команды оборачиваются
-  в `adminOnly`. Админ-хендлеры — в [admin.go](internal/telegram/admin.go).
+  в `adminOnly`, админские кнопки ещё раз проверяют `IsAdmin`. Админ-панель (`/admin`) —
+  в [admin.go](internal/telegram/admin.go): вкладки по статусу, страницы по `users.PageSize`,
+  `users.Service.Page` (счётчики + `LIMIT/OFFSET` по индексу `users_status_seen_idx`).
 - Скорость: каждый запрос к Telegram дорогой (у пользователя прокси, ~1 с). Одно сообщение на
   команду, `answerAsync` для callback, выбор группы — редактирование, а не новые сообщения.
 - Логи в хендлерах — через `b.logger(ctx)`: в нём уже есть update_id/user_id/chat_id.

@@ -38,7 +38,35 @@ func (f *fakeRepo) SetUserStatus(_ context.Context, id int64, s Status) (User, e
 	return u, nil
 }
 
-func (f *fakeRepo) ListUsers(context.Context, int) ([]User, error) { return nil, nil }
+func (f *fakeRepo) GetUser(_ context.Context, id int64) (User, error) {
+	u, ok := f.users[id]
+	if !ok {
+		return User{}, ErrUserNotFound
+	}
+	return u, nil
+}
+
+// UsersPage отдаёт пользователей по возрастанию id — порядок в тестах не важен.
+func (f *fakeRepo) UsersPage(_ context.Context, status Status, offset, limit int) ([]User, error) {
+	var all []User
+	for id := int64(1); id <= 1000; id++ {
+		if u, ok := f.users[id]; ok && u.Status == status {
+			all = append(all, u)
+		}
+	}
+	if offset >= len(all) {
+		return nil, nil
+	}
+	return all[offset:min(offset+limit, len(all))], nil
+}
+
+func (f *fakeRepo) CountUsers(context.Context) (map[Status]int, error) {
+	counts := map[Status]int{}
+	for _, u := range f.users {
+		counts[u.Status]++
+	}
+	return counts, nil
+}
 
 func newTestService(repo Repository, mode Mode, journal *bytes.Buffer) *Service {
 	return NewService(repo, Options{
@@ -138,5 +166,31 @@ func TestDisplayName(t *testing.T) {
 		if got := p.DisplayName(); got != want {
 			t.Errorf("DisplayName(%+v) = %q, want %q", p, got, want)
 		}
+	}
+}
+
+func TestPage(t *testing.T) {
+	repo := newFakeRepo()
+	for id := int64(1); id <= 19; id++ { // 19 ожидающих = 3 страницы по 8
+		repo.users[id] = User{Profile: Profile{ID: id}, Status: StatusPending}
+	}
+	repo.users[100] = User{Profile: Profile{ID: 100}, Status: StatusActive}
+	s := newTestService(repo, ModeApproval, &bytes.Buffer{})
+	ctx := context.Background()
+
+	p, err := s.Page(ctx, StatusPending, 0)
+	if err != nil || p.Total != 3 || p.Number != 0 || len(p.Users) != PageSize || p.Counts[StatusActive] != 1 {
+		t.Fatalf("first page: %+v, %v", p, err)
+	}
+	if p, _ := s.Page(ctx, StatusPending, 2); len(p.Users) != 3 || p.Users[0].ID != 17 {
+		t.Errorf("last page: %d users, first %d", len(p.Users), p.Users[0].ID)
+	}
+	// Страница за пределами (например, после бана последних) приводится к последней.
+	if p, _ := s.Page(ctx, StatusPending, 99); p.Number != 2 {
+		t.Errorf("page 99 clamped to %d, want 2", p.Number)
+	}
+	// Пустая вкладка — одна пустая страница.
+	if p, _ := s.Page(ctx, StatusBlocked, 0); p.Total != 1 || len(p.Users) != 0 {
+		t.Errorf("empty tab: %+v", p)
 	}
 }

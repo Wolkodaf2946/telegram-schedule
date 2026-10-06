@@ -213,13 +213,47 @@ func TestUsersAccess(t *testing.T) {
 		t.Errorf("unknown user err = %v", err)
 	}
 
-	// В списке ожидающие идут первыми.
-	if _, _, err := s.TouchUser(ctx, users.Profile{ID: 200}, users.StatusPending); err != nil {
+	if got, err := s.GetUser(ctx, p.ID); err != nil || got.Username != "renamed" || got.GroupName != "ИОП-ИТ-24/2" {
+		t.Errorf("GetUser = %+v, %v", got, err)
+	}
+	if _, err := s.GetUser(ctx, 999); !errors.Is(err, users.ErrUserNotFound) {
+		t.Errorf("GetUser unknown err = %v", err)
+	}
+}
+
+func TestUsersPageAndCounts(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	// 5 ожидающих (id 1..5, активность по возрастанию id) и 1 забаненный.
+	for id := int64(1); id <= 6; id++ {
+		if _, _, err := s.TouchUser(ctx, users.Profile{ID: id}, users.StatusPending); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.pool.Exec(ctx, `UPDATE users SET last_seen_at = now() + make_interval(secs => $1) WHERE user_id = $2`, id, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.SetUserStatus(ctx, 6, users.StatusBlocked); err != nil {
 		t.Fatal(err)
 	}
-	list, err := s.ListUsers(ctx, 10)
-	if err != nil || len(list) != 2 || list[0].ID != 200 || list[0].Status != users.StatusPending {
-		t.Errorf("list = %+v, %v", list, err)
+
+	counts, err := s.CountUsers(ctx)
+	if err != nil || counts[users.StatusPending] != 5 || counts[users.StatusBlocked] != 1 || counts[users.StatusActive] != 0 {
+		t.Fatalf("counts = %v, %v", counts, err)
+	}
+
+	// Свежие сверху, страницы не пересекаются.
+	first, err := s.UsersPage(ctx, users.StatusPending, 0, 2)
+	if err != nil || len(first) != 2 || first[0].ID != 5 || first[1].ID != 4 {
+		t.Fatalf("page 1 = %+v, %v", first, err)
+	}
+	last, _ := s.UsersPage(ctx, users.StatusPending, 4, 2)
+	if len(last) != 1 || last[0].ID != 1 {
+		t.Errorf("last page = %+v", last)
+	}
+	if beyond, _ := s.UsersPage(ctx, users.StatusPending, 10, 2); len(beyond) != 0 {
+		t.Errorf("page beyond the end must be empty, got %d", len(beyond))
 	}
 }
 

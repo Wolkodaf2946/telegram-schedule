@@ -43,7 +43,7 @@ func (b *Bot) handleStart(ctx context.Context, _ *tg.Bot, u *models.Update) {
 		"на сегодня, на завтра и на любой день через календарь.\n\n", name)
 
 	if !ok {
-		b.send(ctx, chatID, intro+textChooseGroup, mainKeyboard())
+		b.send(ctx, chatID, intro+textChooseGroup, b.mainKeyboard(senderID(u)))
 		return
 	}
 	b.send(ctx, chatID, intro+fmt.Sprintf(
@@ -51,7 +51,7 @@ func (b *Bot) handleStart(ctx context.Context, _ *tg.Bot, u *models.Update) {
 			"• %s и %s — пары на день, под расписанием кнопки ◀ ▶\n"+
 			"• %s — любой день месяца\n"+
 			"• %s — сменить группу",
-		escape(g.Name), btnToday, btnTomorrow, btnCalendar, btnGroup), mainKeyboard())
+		escape(g.Name), btnToday, btnTomorrow, btnCalendar, btnGroup), b.mainKeyboard(senderID(u)))
 }
 
 func (b *Bot) handleHelp(ctx context.Context, _ *tg.Bot, u *models.Update) {
@@ -64,11 +64,10 @@ func (b *Bot) handleHelp(ctx context.Context, _ *tg.Bot, u *models.Update) {
 		"В календаре цифрой отмечены дни с парами, точкой — свободные, [в скобках] — сегодня."
 	if b.users.IsAdmin(senderID(u)) {
 		text += "\n\n<b>Администратору</b>\n" +
-			"/users — пользователи и заявки\n" +
-			"/allow &lt;id&gt; — открыть доступ, /revoke &lt;id&gt; — закрыть\n" +
+			"/admin — панель: заявки, пользователи, баны\n" +
 			"/refresh — обновить расписание сейчас"
 	}
-	b.send(ctx, u.Message.Chat.ID, text, mainKeyboard())
+	b.send(ctx, u.Message.Chat.ID, text, b.mainKeyboard(senderID(u)))
 }
 
 func (b *Bot) handleToday(ctx context.Context, _ *tg.Bot, u *models.Update) {
@@ -115,7 +114,7 @@ func (b *Bot) handleText(ctx context.Context, _ *tg.Bot, u *models.Update) {
 	}
 	chatID, text := u.Message.Chat.ID, strings.TrimSpace(u.Message.Text)
 	if strings.HasPrefix(text, "/") {
-		b.send(ctx, chatID, "Не знаю такой команды 🙂 Список команд — /help.", mainKeyboard())
+		b.send(ctx, chatID, "Не знаю такой команды 🙂 Список команд — /help.", b.mainKeyboard(senderID(u)))
 		return
 	}
 	if !b.search.Allow(senderID(u), time.Now()) {
@@ -131,7 +130,7 @@ func (b *Bot) handleText(ctx context.Context, _ *tg.Bot, u *models.Update) {
 	groups, err := b.svc.SearchGroups(ctx, text)
 	switch {
 	case errors.Is(err, schedule.ErrQueryTooShort):
-		b.send(ctx, chatID, fmt.Sprintf("Для поиска группы нужно хотя бы %d символа. Список команд — /help.", schedule.MinQueryLen), mainKeyboard())
+		b.send(ctx, chatID, fmt.Sprintf("Для поиска группы нужно хотя бы %d символа. Список команд — /help.", schedule.MinQueryLen), b.mainKeyboard(senderID(u)))
 		return
 	case err != nil:
 		b.logger(ctx).Error("search groups", "err", err, "query", text)
@@ -174,6 +173,9 @@ func (b *Bot) handleCallback(ctx context.Context, _ *tg.Bot, u *models.Update) {
 		return
 	case actionAccess:
 		b.handleAccessCallback(ctx, q, cb)
+		return
+	case actionAdmin:
+		b.handleAdminCallback(ctx, q, cb)
 		return
 	case actionGroup:
 		b.selectGroup(ctx, q, cb.groupID)
@@ -251,7 +253,7 @@ func (b *Bot) withUserGroup(ctx context.Context, u *models.Update, f func(schedu
 	case err != nil:
 		b.fail(ctx, u.Message.Chat.ID, "get user group", err)
 	case !ok:
-		b.send(ctx, u.Message.Chat.ID, "Сначала выберите группу.\n\n"+textChooseGroup, mainKeyboard())
+		b.send(ctx, u.Message.Chat.ID, "Сначала выберите группу.\n\n"+textChooseGroup, b.mainKeyboard(senderID(u)))
 	default:
 		f(g)
 	}
@@ -303,16 +305,9 @@ func (b *Bot) startupText(ctx context.Context) string {
 		fmt.Fprintf(&sb, "Обновление расписания: %s (%s)\n", strings.Join(times, ", "), b.opts.Location)
 	}
 
-	if list, err := b.users.List(ctx, 1000); err == nil {
-		pending := 0
-		for _, u := range list {
-			if u.Status == users.StatusPending {
-				pending++
-			}
-		}
-		if pending > 0 {
-			fmt.Fprintf(&sb, "⏳ Заявок на доступ: %d — /users\n", pending)
-		}
+	if counts, err := b.users.Counts(ctx); err == nil {
+		fmt.Fprintf(&sb, "Пользователи: ✅ %d · ⏳ %d · ⛔ %d — /admin\n",
+			counts[users.StatusActive], counts[users.StatusPending], counts[users.StatusBlocked])
 	}
 
 	groups, err := b.sync.Groups(ctx)
